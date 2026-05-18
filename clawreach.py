@@ -785,6 +785,20 @@ FRONTEND_HTML = r"""<!doctype html>
   }
   .filter-body label:hover { background: var(--rule); }
   .filter-body input[type="checkbox"] { accent-color: var(--act-write); }
+  .time-controls {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 8px; background: var(--rule); border-radius: 4px;
+  }
+  .time-controls input[type=range] {
+    accent-color: var(--act-write); width: 180px;
+  }
+  .time-controls #time-display {
+    font-size: 11px; color: var(--accent-soft); min-width: 9ch; text-align: right;
+  }
+  .time-controls button {
+    background: transparent; border: none; color: var(--ink);
+    padding: 0 6px; cursor: pointer; font-size: 14px;
+  }
   .filter-body .actions {
     display: flex; gap: 8px; padding: 4px 0;
     border-bottom: 1px solid var(--rule); margin-bottom: 4px;
@@ -864,6 +878,11 @@ FRONTEND_HTML = r"""<!doctype html>
       <div id="filter-projects-body"></div>
     </div>
   </details>
+  <div class="time-controls">
+    <button id="time-play" title="Play / pause">▶</button>
+    <input type="range" id="time-slider" min="0" max="1000" value="1000" step="1">
+    <span id="time-display">live</span>
+  </div>
   <button id="rescan">Re-scan</button>
   <button id="reset">Reset view</button>
   <span class="meta" style="margin-left:auto">click a node to expand/collapse · drag to pan · scroll to zoom</span>
@@ -913,6 +932,12 @@ let lastMeta = null;
 // it's an array of explicitly-selected values.
 let filters = loadFilters();
 
+// Time-slider state.
+let timeMin = 0, timeMax = 0;
+let timeCutoff = 0;       // current slider value (ms since epoch)
+let isPlaying = false;
+let playInterval = null;
+
 const ACTION_PRIORITY = { write:0, edit:1, read:2, bash:3, list:4, observe:5 };
 
 function loadFilters() {
@@ -929,7 +954,21 @@ function saveFilters() {
 function eventPasses(ev) {
   if (filters.sessions !== null && !filters.sessions.includes(ev.session)) return false;
   if (filters.projects !== null && !filters.projects.includes(ev.project)) return false;
+  // Time slider: when cutoff is at max we accept everything (incl. ts==max).
+  if (timeMax > 0 && timeCutoff < timeMax && ev.ts) {
+    const evMs = Date.parse(ev.ts);
+    if (Number.isFinite(evMs) && evMs > timeCutoff) return false;
+  }
   return true;
+}
+
+function isFilterActive() {
+  if (filters.sessions !== null && lastMeta &&
+      filters.sessions.length !== lastMeta.sessions.length) return true;
+  if (filters.projects !== null && lastMeta &&
+      filters.projects.length !== lastMeta.projects.length) return true;
+  if (timeMax > 0 && timeCutoff < timeMax) return true;
+  return false;
 }
 
 // Build a hierarchy from a filtered event list. No filesystem access, so the
@@ -1013,15 +1052,70 @@ function buildTreeFromEvents(events) {
   return makeNode(rootPath);
 }
 
-function applyFiltersAndRender() {
+function applyFiltersAndRender(opts = {}) {
   const filtered = lastEvents.filter(eventPasses);
   const treeData = buildTreeFromEvents(filtered);
   root = d3.hierarchy(treeData);
   root.x0 = 0; root.y0 = 0;
   collapseUntouched(root);
-  initialTransform = null;
+  // skipFit: during time-slider playback we want the camera to stay put.
+  // On manual filter changes we re-fit so the focused view is centered.
+  if (!opts.skipFit) initialTransform = null;
   update(root);
 }
+
+function setTimeCutoff(ms, opts = {}) {
+  timeCutoff = ms;
+  const slider = document.getElementById("time-slider");
+  slider.value = ms;
+  const display = document.getElementById("time-display");
+  display.textContent = ms >= timeMax ? "live" :
+    new Date(ms).toLocaleString(undefined, { month: "short", day: "2-digit",
+                                              hour: "2-digit", minute: "2-digit",
+                                              second: "2-digit" });
+  applyFiltersAndRender(opts);
+}
+
+function initTimeSlider(meta) {
+  timeMin = meta.time_min ? Date.parse(meta.time_min) : 0;
+  timeMax = meta.time_max ? Date.parse(meta.time_max) : 0;
+  if (!Number.isFinite(timeMin) || !Number.isFinite(timeMax) || timeMax <= timeMin) {
+    document.getElementById("time-slider").disabled = true;
+    document.getElementById("time-play").disabled = true;
+    return;
+  }
+  timeCutoff = timeMax;
+  const slider = document.getElementById("time-slider");
+  slider.min = timeMin;
+  slider.max = timeMax;
+  slider.value = timeMax;
+  // Smooth dragging: ~1000 distinct stops across the whole range.
+  slider.step = Math.max(1, Math.floor((timeMax - timeMin) / 1000));
+  slider.oninput = () => {
+    if (isPlaying) togglePlay();  // any manual scrub pauses playback
+    setTimeCutoff(parseInt(slider.value, 10));
+  };
+}
+
+function togglePlay() {
+  const btn = document.getElementById("time-play");
+  isPlaying = !isPlaying;
+  btn.textContent = isPlaying ? "⏸" : "▶";
+  if (isPlaying) {
+    // If we're at the end, rewind to the start before playing.
+    if (timeCutoff >= timeMax) setTimeCutoff(timeMin, { skipFit: true });
+    // ~10 ticks/sec, advancing ~2% of the range per tick → ~5s playback.
+    const stepSize = Math.max(1, Math.floor((timeMax - timeMin) / 50));
+    playInterval = setInterval(() => {
+      const next = Math.min(timeMax, timeCutoff + stepSize);
+      setTimeCutoff(next, { skipFit: true });
+      if (next >= timeMax) togglePlay();  // auto-pause at end
+    }, 100);
+  } else {
+    if (playInterval) { clearInterval(playInterval); playInterval = null; }
+  }
+}
+document.getElementById("time-play").onclick = () => togglePlay();
 
 function renderFilterUI(kind, all, eventsBySession) {
   // kind: "sessions" | "projects"
@@ -1311,10 +1405,10 @@ async function load(rescan) {
   renderFilterUI("sessions", meta.sessions || []);
   renderFilterUI("projects", meta.projects || []);
   updateFilterSummaries();
-  // First render uses the server-built tree (with sibling context). Once the
-  // user touches a filter we switch to the client-built filtered hierarchy.
-  if ((filters.sessions === null || filters.sessions.length === (meta.sessions || []).length)
-      && (filters.projects === null || filters.projects.length === (meta.projects || []).length)) {
+  initTimeSlider(meta);
+  // Unfiltered → use the server's tree (it includes sibling context the
+  // client can't reconstruct without disk access). Otherwise rebuild locally.
+  if (!isFilterActive()) {
     root = d3.hierarchy(data);
     root.x0 = 0; root.y0 = 0;
     collapseUntouched(root);
