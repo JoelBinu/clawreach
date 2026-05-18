@@ -1,25 +1,25 @@
 # ClawReach
 
-> See which parts of your filesystem Claude Code has actually reached into.
+> See which parts of your filesystem Claude Code has actually reached into — and what it *did* there.
 
-ClawReach parses your local [Claude Code](https://docs.claude.com/en/docs/claude-code) transcripts, extracts every file and directory the agent (and any subagents) touched via tool calls, and renders the surrounding filesystem as a collapsible D3 tree. Touched branches are highlighted; everything else is collapsed by default so the signal is obvious at a glance.
+ClawReach parses your local [Claude Code](https://docs.claude.com/en/docs/claude-code) transcripts, extracts every file and directory the agent (and any subagents) touched, and renders the surrounding filesystem as a collapsible D3 tree. Each node is colored by what Claude did to it — **written, edited, read, bash-touched, listed, or observed in output** — so the signal is obvious at a glance.
 
 ```
-┌─ ClawReach ── 31 events · 18 paths · root: / ───────[Re-scan][Reset]──┐
+┌─ ClawReach ── 147 events · 52 paths · root: / ──────[Re-scan][Reset]──┐
 │                                                                       │
 │  /                                                                    │
-│  └── Users                                                            │
-│      └── you                                                          │
-│          ├── .claude/                                                 │
-│          │   └── projects/  ●                                         │
-│          │       ├── <encoded-project-A>/  ●●●                        │
-│          │       └── <encoded-project-B>/  ●                          │
-│          └── Desktop/                                                 │
-│              └── ClawReach/  ●●●●                                     │
-│                  ├── clawreach.py  ●●●                                │
-│                  └── README.md                                        │
+│  └── Users/you                                                        │
+│      ├── .claude/                                                     │
+│      │   └── projects/  ◆ list                                        │
+│      │       └── <encoded-project>/  ◆ read                           │
+│      └── Desktop/ClawReach/                                           │
+│          ├── clawreach.py  ● write   (created)                        │
+│          ├── README.md     ● write   (created)                        │
+│          ├── .gitignore    ◆ edit    (modified)                       │
+│          └── LICENSE       ● write                                    │
 │                                                                       │
-│  ● = touched by Claude  ·  size encodes access count                  │
+│  ● write   ◆ edit   ● read   ● bash   ● list   ● observe              │
+│  size = access count   ·   color = primary action                     │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -27,9 +27,10 @@ ClawReach parses your local [Claude Code](https://docs.claude.com/en/docs/claude
 
 You can scroll a transcript to see what Claude did — but you can't see *where* it happened in relation to the rest of your filesystem. ClawReach answers questions like:
 
-- Which directories did Claude actually open files from this session?
+- Which files did Claude **write or generate** this session?
+- What did it merely **read** vs **modify in place**?
 - Did it stay inside the project, or wander into `~/.ssh`?
-- Across all my sessions, which files have been touched most often?
+- Across all my sessions, which paths have been touched most often, and how?
 - Did a subagent reach into something the main thread never opened?
 
 ## Requirements
@@ -50,23 +51,32 @@ The default port is `8765`; your browser opens to `http://127.0.0.1:8765/` autom
 
 ## How it works
 
-Three stages, all in one stdlib-only Python file (~450 lines):
+Three stages, all in one stdlib-only Python file:
 
-1. **Ingest.** Walk `~/.claude/projects/**/*.jsonl`. For each `assistant`-typed entry, iterate the `message.content[]` blocks and pull every `tool_use`. Map the tool to the path(s) it touched:
-   - `Read` / `Edit` / `Write` / `MultiEdit` / `NotebookEdit` / `NotebookRead` → `input.file_path` (or `notebook_path`)
-   - `Glob` / `Grep` / `LS` → `input.path` (falls back to the entry's `cwd`)
-   - `Bash` → shlex-split the command, keep tokens that look like absolute or `~`-relative paths
+1. **Ingest.** Walk `~/.claude/projects/**/*.jsonl` and collect access events from three signal sources, in order of authority:
 
-   Each hit becomes an `AccessEvent(path, tool, timestamp, session, project, is_sidechain)`.
+   1. **`tool_use` blocks** on assistant entries. Each call is mapped to one or more `(path, action)` pairs:
 
-2. **Scan.** Build a tree rooted at the common ancestor of every accessed path. Include all ancestors of every accessed path, and add one level of immediate siblings around each accessed directory so the user sees what's *next to* the file Claude touched. Skip noise dirs (`.git`, `node_modules`, `__pycache__`, build caches, IDE caches, etc.).
+      | Tool | Action | Path source |
+      |---|---|---|
+      | `Read`, `NotebookRead` | `read` | `input.file_path` / `notebook_path` |
+      | `Write` | `write` | `input.file_path` |
+      | `Edit`, `MultiEdit`, `NotebookEdit` | `edit` | `input.file_path` / `notebook_path` |
+      | `Glob`, `Grep`, `LS` | `list` | `input.path` (falls back to entry `cwd`) |
+      | `Bash` | `read` / `write` / `list` / `bash` | path tokens from `input.command`; action picked from the command verb (`cat`/`ls`/`mkdir`/…) and presence of `>` / `>>` redirects |
+
+   2. **`file-history-snapshot` entries.** Claude Code keeps its own ledger of files it modified in `snapshot.trackedFileBackups`. These are emitted as authoritative `write` events — better than any heuristic.
+
+   3. **`tool_result` blocks** (on user entries). For `Bash`/`LS`/`Glob`/`Grep`, absolute paths surfaced in the result text become `observe` events — files Claude *saw* but never directly opened. The Write tool's `"File created successfully at: <path>"` confirmation is upgraded to `write`. Capped per result so a noisy `npm install` doesn't drown out the tree.
+
+2. **Scan.** Build a tree rooted at the common ancestor of every accessed path. Include all ancestors of every accessed path, plus one level of immediate siblings around each accessed directory so you see what's *next to* the file Claude touched. Skip noise dirs (`.git`, `node_modules`, `__pycache__`, build caches, IDE caches, etc.).
 
 3. **Serve.** A stdlib `ThreadingHTTPServer` exposes:
    - `GET /` — the single-page D3 frontend
    - `GET /api/tree` — cached tree as JSON
    - `GET /api/rescan` — re-ingest transcripts and rebuild the tree
 
-   The frontend collapses any subtree that contains zero accessed nodes, so the default view is just the slice Claude has actually reached. Click a node to expand/collapse; the sidebar shows per-node stats (count, last seen, tool breakdown, sessions, projects, sidechain count).
+   The frontend collapses any subtree that contains zero accessed nodes, so the default view is just the slice Claude has actually reached. Each touched node is colored by its **primary action** (`write > edit > read > bash > list > observe`). Click a node to expand/collapse; the sidebar shows the full action breakdown (stacked bar + per-action counts) and per-session/per-project attribution.
 
 ## CLI reference
 
@@ -97,7 +107,9 @@ A `<node>` is:
   "access": {                      // present only if the node was touched
     "count": 7,
     "last_ts": "2026-05-18T16:03:29.074Z",
-    "tools": { "Read": 4, "Edit": 3 },
+    "primary": "write",            // strongest signal: write > edit > read > bash > list > observe
+    "actions": { "write": 1, "read": 4, "edit": 2 },
+    "tools":   { "Write": 1, "Read": 4, "Edit": 2 },
     "sessions": ["8e5900ea-..."],
     "projects": ["-Users-you-Desktop-ClawReach"],
     "sidechain": 0
@@ -110,7 +122,8 @@ A `<node>` is:
 
 ## Caveats
 
-- **Bash path extraction is heuristic.** It keeps tokens matching `^~?/[\w./\-+@:%]+` and ignores everything else. This favors precision over recall — better to miss the occasional path than flood the tree with `-la`, `HEAD`, or `main`. If you want better Bash coverage, swap `_extract_bash_paths` for something AST-based (e.g. `bashlex`).
+- **Bash classification is heuristic.** Path extraction keeps tokens matching `^~?/[\w./\-+@:%]+` (precision over recall). Action classification looks at the command's first verb (`cat`→read, `mkdir`→write, etc.) and the presence of `>` / `>>`. Files generated by tools like `gcc`, `npm install`, `python build.py` won't be tagged as `write` unless the command itself redirects — for those, [`file-history-snapshot`](#how-it-works) is the authoritative source for files Claude wrote through its own tools, but it can't see Bash side effects.
+- **`observe` is a weak signal.** It's anything that surfaced as an absolute path in tool result text. Useful for context (Claude knew this file exists), but doesn't mean Claude opened it. The frontend colors these the most muted of any category.
 - **Sibling depth is fixed at 1.** Enough for context, not enough for clutter. Bump it by editing `build_tree`.
 - **Transcripts live on disk and grow.** The ingester rescans them all on every `/api/rescan`. For very large transcript corpora, add an mtime-based incremental cache.
 - **Symlinks aren't dereferenced.** Paths are normalized but not resolved through symlinks; the tree shows what the transcript literally referenced.

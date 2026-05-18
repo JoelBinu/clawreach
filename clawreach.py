@@ -35,18 +35,38 @@ from typing import Iterable
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 DEFAULT_PORT = 8765
 
-# Tools whose `input` carries a single absolute path under a well-known key.
+# What Claude *did* to the path. Drives the visual category in the frontend.
+#   read    — saw the bytes (Read, cat, Grep with content)
+#   write   — created or fully replaced (Write, mkdir, touch, shell redirect)
+#   edit    — modified in place (Edit, MultiEdit, NotebookEdit)
+#   list    — saw the path exists but not its content (Glob, Grep, LS, find)
+#   observe — surfaced incidentally in tool output (less authoritative)
+#   bash    — touched by shell, can't tell what was done
+ACTIONS = ("write", "edit", "read", "bash", "list", "observe")
+ACTION_PRIORITY = {a: i for i, a in enumerate(ACTIONS)}  # lower = "more interesting"
+
+# Tools whose `input` carries a single path under a well-known key.
+# Each maps to (input_key, action).
 PATH_KEY_TOOLS = {
-    "Read": "file_path",
-    "Edit": "file_path",
-    "Write": "file_path",
-    "MultiEdit": "file_path",
-    "NotebookEdit": "notebook_path",
-    "NotebookRead": "notebook_path",
+    "Read":         ("file_path",     "read"),
+    "Edit":         ("file_path",     "edit"),
+    "MultiEdit":    ("file_path",     "edit"),
+    "Write":        ("file_path",     "write"),
+    "NotebookRead": ("notebook_path", "read"),
+    "NotebookEdit": ("notebook_path", "edit"),
 }
 
-# Tools whose `input` carries a directory under `path` (Glob/Grep both optional).
+# Tools whose `input` carries a directory under `path`. All "list" actions.
 DIR_KEY_TOOLS = {"Glob", "Grep", "LS"}
+
+# Bash command dispatch: which verb implies what action.
+BASH_READ_CMDS  = {"cat", "less", "more", "tail", "head", "file", "stat", "wc",
+                   "md5", "md5sum", "sha1sum", "sha256sum", "shasum", "xxd",
+                   "od", "diff", "cmp"}
+BASH_LIST_CMDS  = {"ls", "find", "tree", "du", "fd", "grep", "rg", "ag", "ack",
+                   "locate", "which", "whereis"}
+BASH_WRITE_CMDS = {"mkdir", "touch", "rm", "rmdir", "cp", "mv", "ln", "chmod",
+                   "chown", "dd", "tee", "install", "rsync"}
 
 # Names of dirs we never want in the tree — they bury the signal in noise.
 IGNORE_DIR_NAMES = {
@@ -60,6 +80,12 @@ IGNORE_DIR_NAMES = {
 # Matches absolute paths and tilde paths; conservative on relative paths to
 # avoid pulling in random argv noise.
 PATH_TOKEN_RE = re.compile(r"^(~?/[\w./\-+@:%]+)")
+# Absolute paths anywhere in a free-form string (used to mine tool_result text).
+ABS_PATH_IN_TEXT_RE = re.compile(r"(?:^|[\s'\"`(\[])(/[\w./\-+@:%]{2,})")
+
+# Cap mined paths per tool_result to keep the tree small under chatty outputs
+# like a recursive `ls` or a noisy `npm install`.
+MAX_MINED_PATHS_PER_RESULT = 100
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +95,8 @@ PATH_TOKEN_RE = re.compile(r"^(~?/[\w./\-+@:%]+)")
 @dataclass
 class AccessEvent:
     path: str        # absolute, normalized
-    tool: str
+    tool: str        # tool name (Read/Edit/Write/Bash/...) or "snapshot" / "result"
+    action: str      # one of ACTIONS — what Claude *did* to the path
     ts: str          # ISO timestamp from the transcript
     session: str
     project: str     # the encoded project dir name (= cwd with / → -)
@@ -116,8 +143,38 @@ def _extract_bash_paths(command: str, cwd: str | None) -> list[str]:
     return out
 
 
-def _iter_tool_uses(entry: dict) -> Iterable[tuple[str, dict]]:
-    """Yield (tool_name, input_dict) for every tool_use in an assistant entry."""
+def _bash_action(command: str) -> str:
+    """Classify a Bash command as read/write/list/bash by its primary verb.
+
+    Order matters: a redirect like `python build.py > out.txt` is a write even
+    though the verb is `python`, so we look for `>` / `>>` first.
+    """
+    # Redirect → file is being written. Cheap check; tolerates quoting noise.
+    if re.search(r"(?<![<>])>{1,2}(?![&>])", command):
+        return "write"
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return "bash"
+    for tok in tokens:
+        if not tok or tok.startswith("-"):
+            continue
+        # skip env-var prefixes like FOO=bar cmd ...
+        if "=" in tok and tok.split("=", 1)[0].isupper() and tok.split("=", 1)[0].replace("_", "").isalnum():
+            continue
+        verb = os.path.basename(tok)
+        # peel off `sudo` and try the next token
+        if verb in {"sudo", "command", "exec", "time", "nohup"}:
+            continue
+        if verb in BASH_READ_CMDS:  return "read"
+        if verb in BASH_LIST_CMDS:  return "list"
+        if verb in BASH_WRITE_CMDS: return "write"
+        return "bash"
+    return "bash"
+
+
+def _iter_tool_uses(entry: dict) -> Iterable[tuple[str, dict, str]]:
+    """Yield (tool_name, input_dict, tool_use_id) for every tool_use in an assistant entry."""
     msg = entry.get("message")
     if not isinstance(msg, dict):
         return
@@ -129,13 +186,29 @@ def _iter_tool_uses(entry: dict) -> Iterable[tuple[str, dict]]:
             name = block.get("name") or ""
             inp = block.get("input") or {}
             if isinstance(inp, dict):
-                yield name, inp
+                yield name, inp, block.get("id") or ""
 
 
 def parse_transcript(jsonl_path: Path) -> list[AccessEvent]:
-    """Stream a single .jsonl transcript and return every AccessEvent in it."""
+    """Stream a .jsonl transcript and return every AccessEvent in it.
+
+    Three signal sources, in order of authority:
+      1. `tool_use` blocks on assistant entries (Read/Edit/Write/Bash/...)
+      2. `file-history-snapshot` entries — Claude Code's own ledger of files
+         it modified. Ground truth for writes.
+      3. `tool_result` blocks on user entries — mine the output text of
+         Bash/LS/Glob/Grep for additional paths Claude *observed*.
+    """
     project = jsonl_path.parent.name
     events: list[AccessEvent] = []
+    # Map tool_use_id -> tool name, so we can interpret tool_result blocks.
+    use_to_tool: dict[str, str] = {}
+    # Track most-recently-seen cwd; file-history-snapshot entries don't carry
+    # one but the surrounding messages do.
+    last_cwd: str | None = _decode_project_cwd(project)
+    last_session: str = ""
+    last_sidechain: bool = False
+
     with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -145,34 +218,131 @@ def parse_transcript(jsonl_path: Path) -> list[AccessEvent]:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if entry.get("type") != "assistant":
-                continue
+            etype = entry.get("type")
             ts = entry.get("timestamp") or ""
-            session = entry.get("sessionId") or ""
-            cwd = entry.get("cwd")
-            sidechain = bool(entry.get("isSidechain"))
-            for tool, inp in _iter_tool_uses(entry):
-                paths = _paths_for_tool(tool, inp, cwd)
-                for p in paths:
-                    events.append(AccessEvent(p, tool, ts, session, project, sidechain))
+            cwd = entry.get("cwd") or last_cwd
+            if entry.get("cwd"):
+                last_cwd = entry["cwd"]
+            session = entry.get("sessionId") or last_session
+            last_session = session or last_session
+            sidechain = bool(entry.get("isSidechain", last_sidechain))
+            last_sidechain = sidechain
+
+            if etype == "assistant":
+                for tool, inp, tu_id in _iter_tool_uses(entry):
+                    if tu_id:
+                        use_to_tool[tu_id] = tool
+                    for path, action in _paths_for_tool(tool, inp, cwd):
+                        events.append(AccessEvent(
+                            path, tool, action, ts, session, project, sidechain))
+            elif etype == "file-history-snapshot":
+                snap = entry.get("snapshot") or {}
+                tfb = snap.get("trackedFileBackups") or {}
+                snap_ts = snap.get("timestamp") or ts
+                for rel_path in tfb.keys():
+                    p = _expand(rel_path, cwd)
+                    if p:
+                        events.append(AccessEvent(
+                            p, "snapshot", "write", snap_ts, session, project, sidechain))
+            elif etype == "user":
+                # tool_result blocks live inside user-typed messages.
+                for tu_id, text in _iter_tool_results(entry):
+                    src_tool = use_to_tool.get(tu_id, "")
+                    for path, action in _mine_result_paths(src_tool, text, cwd):
+                        events.append(AccessEvent(
+                            path, src_tool or "result", action, ts, session, project, sidechain))
     return events
 
 
-def _paths_for_tool(tool: str, inp: dict, cwd: str | None) -> list[str]:
-    """Map (tool, input) → list of absolute paths the call touched."""
+def _decode_project_cwd(project_dir_name: str) -> str | None:
+    """Best-effort decode of ~/.claude/projects/<dir>/ into the original cwd.
+
+    Claude Code encodes the cwd by replacing `/` with `-`. The decode is lossy
+    for paths that legitimately contain `-` in component names, but works for
+    the typical case (~/Desktop/Foo etc.). Only used as a fallback when no
+    sibling entry exposes the true cwd.
+    """
+    if not project_dir_name.startswith("-"):
+        return None
+    return "/" + project_dir_name.lstrip("-").replace("-", "/")
+
+
+def _paths_for_tool(tool: str, inp: dict, cwd: str | None) -> list[tuple[str, str]]:
+    """Map (tool, input) → list of (absolute_path, action) the call touched."""
     if tool in PATH_KEY_TOOLS:
-        key = PATH_KEY_TOOLS[tool]
+        key, action = PATH_KEY_TOOLS[tool]
         p = _expand(inp.get(key), cwd)
-        return [p] if p else []
+        return [(p, action)] if p else []
     if tool in DIR_KEY_TOOLS:
         p = _expand(inp.get("path"), cwd) if inp.get("path") else cwd
-        return [p] if p else []
+        return [(p, "list")] if p else []
     if tool == "Bash":
         cmd = inp.get("command")
-        if isinstance(cmd, str):
-            return _extract_bash_paths(cmd, cwd)
-        return []
+        if not isinstance(cmd, str):
+            return []
+        action = _bash_action(cmd)
+        return [(p, action) for p in _extract_bash_paths(cmd, cwd)]
     return []
+
+
+def _iter_tool_results(entry: dict) -> Iterable[tuple[str, str]]:
+    """Yield (tool_use_id, text) for every tool_result block in a user entry."""
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tu_id = block.get("tool_use_id") or ""
+        c = block.get("content")
+        # tool_result content can be a string or a list of {type:text, text:...}.
+        if isinstance(c, str):
+            yield tu_id, c
+        elif isinstance(c, list):
+            for sub in c:
+                if isinstance(sub, dict) and sub.get("type") == "text":
+                    t = sub.get("text")
+                    if isinstance(t, str):
+                        yield tu_id, t
+
+
+def _mine_result_paths(src_tool: str, text: str, cwd: str | None) -> list[tuple[str, str]]:
+    """Pull absolute paths out of tool_result text, tag as 'observe'.
+
+    For Write results we look for the specific 'File created successfully at: <path>'
+    marker and tag those as 'write' — that's a direct confirmation, not a hint.
+    Capped at MAX_MINED_PATHS_PER_RESULT to avoid drowning the tree.
+    """
+    if not text:
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    # Write tool's own success message — strongest confirmation we have.
+    if src_tool == "Write":
+        m = re.search(r"File created successfully at:\s*(\S+)", text)
+        if m:
+            p = _expand(m.group(1), cwd)
+            if p and p not in seen:
+                out.append((p, "write"))
+                seen.add(p)
+
+    if src_tool in {"Bash", "LS", "Glob", "Grep", "result", ""}:
+        for m in ABS_PATH_IN_TEXT_RE.finditer(text):
+            raw = m.group(1)
+            # Strip trailing punctuation that often follows paths in prose.
+            raw = raw.rstrip(".,;:)\"'`]")
+            p = _expand(raw, cwd)
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            out.append((p, "observe"))
+            if len(out) >= MAX_MINED_PATHS_PER_RESULT:
+                break
+    return out
 
 
 def ingest_all(projects_dir: Path) -> list[AccessEvent]:
@@ -197,6 +367,7 @@ class PathStats:
     count: int = 0
     last_ts: str = ""
     tools: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    actions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     sessions: set[str] = field(default_factory=set)
     projects: set[str] = field(default_factory=set)
     sidechain_count: int = 0
@@ -206,15 +377,30 @@ class PathStats:
         if ev.ts > self.last_ts:
             self.last_ts = ev.ts
         self.tools[ev.tool] += 1
+        self.actions[ev.action] += 1
         self.sessions.add(ev.session)
         self.projects.add(ev.project)
         if ev.is_sidechain:
             self.sidechain_count += 1
 
+    @property
+    def primary_action(self) -> str:
+        """The 'most interesting' action seen on this path.
+
+        Precedence (per ACTION_PRIORITY): write > edit > read > bash > list > observe.
+        A path that was written once and read ten times still shows as 'write'
+        because that's the stronger signal about what Claude *did* there.
+        """
+        if not self.actions:
+            return "observe"
+        return min(self.actions.keys(), key=lambda a: ACTION_PRIORITY.get(a, 99))
+
     def to_dict(self) -> dict:
         return {
             "count": self.count,
             "last_ts": self.last_ts,
+            "primary": self.primary_action,
+            "actions": dict(self.actions),
             "tools": dict(self.tools),
             "sessions": sorted(self.sessions),
             "projects": sorted(self.projects),
@@ -449,10 +635,16 @@ FRONTEND_HTML = r"""<!doctype html>
     --ink: #d8dee9;
     --muted: #6b7280;
     --rule: #1f2630;
-    --accent: #ff7a45;       /* Claude orange-ish */
     --accent-soft: #ffb088;
-    --dir: #5b7cff;
-    --untouched: #2a313b;
+    --dir: #3a4252;          /* untouched directory */
+    --untouched: #242a33;    /* untouched file */
+    /* Per-action palette — keep aligned with ACTIONS in clawreach.py */
+    --act-write:   #ff7a45;  /* orange  — created / generated  */
+    --act-edit:    #ffd166;  /* yellow  — modified in place    */
+    --act-read:    #4dd0e1;  /* cyan    — bytes read           */
+    --act-bash:    #b88cff;  /* purple  — shell-touched        */
+    --act-list:    #5b7cff;  /* blue    — listed / matched     */
+    --act-observe: #6b7280;  /* grey    — surfaced in output   */
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -484,6 +676,14 @@ FRONTEND_HTML = r"""<!doctype html>
   aside h2 { font-size: 12px; color: var(--muted); text-transform: uppercase;
              letter-spacing: 1px; margin: 0 0 8px; font-weight: 600; }
   aside .path { word-break: break-all; color: var(--accent-soft); margin-bottom: 12px; }
+  aside .primary-chip {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 11px; margin-bottom: 10px; color: #0b0d11; font-weight: 600;
+    letter-spacing: .5px; text-transform: uppercase;
+  }
+  .action-bar { display: flex; gap: 4px; height: 8px; margin: 4px 0 12px;
+                border-radius: 2px; overflow: hidden; }
+  .action-bar > div { height: 100%; }
   aside dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0 0 14px; }
   aside dt { color: var(--muted); }
   aside dd { margin: 0; }
@@ -495,17 +695,18 @@ FRONTEND_HTML = r"""<!doctype html>
     paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round;
   }
   .node.untouched text { fill: var(--muted); }
-  .link {
-    fill: none; stroke: var(--rule); stroke-width: 1px;
-  }
-  .link.touched { stroke: var(--accent); stroke-opacity: .55; }
+  .link { fill: none; stroke: var(--rule); stroke-width: 1px; }
+  .link.touched { stroke-opacity: .55; stroke-width: 1.4px; }
   .legend {
     position: absolute; bottom: 10px; left: 10px;
-    background: rgba(20,24,31,.85); padding: 8px 10px; border-radius: 4px;
-    border: 1px solid var(--rule); color: var(--muted); font-size: 11px;
+    background: rgba(20,24,31,.92); padding: 8px 12px; border-radius: 4px;
+    border: 1px solid var(--rule); color: var(--ink); font-size: 11px;
+    display: grid; grid-template-columns: max-content max-content; gap: 4px 14px;
   }
-  .legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
-                 vertical-align: middle; margin-right: 6px; }
+  .legend .item { display: flex; align-items: center; gap: 6px; }
+  .legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
+  .legend .hint { grid-column: 1 / -1; color: var(--muted); margin-top: 4px;
+                  padding-top: 4px; border-top: 1px solid var(--rule); }
 </style>
 </head>
 <body>
@@ -520,10 +721,13 @@ FRONTEND_HTML = r"""<!doctype html>
   <div id="viz">
     <svg></svg>
     <div class="legend">
-      <div><span class="dot" style="background:var(--accent)"></span>touched by Claude</div>
-      <div><span class="dot" style="background:var(--dir)"></span>directory (untouched)</div>
-      <div><span class="dot" style="background:var(--untouched)"></span>file (untouched)</div>
-      <div style="margin-top:4px">node size = access count</div>
+      <div class="item"><span class="dot" style="background:var(--act-write)"></span>written / generated</div>
+      <div class="item"><span class="dot" style="background:var(--act-edit)"></span>edited in place</div>
+      <div class="item"><span class="dot" style="background:var(--act-read)"></span>read</div>
+      <div class="item"><span class="dot" style="background:var(--act-bash)"></span>bash-touched</div>
+      <div class="item"><span class="dot" style="background:var(--act-list)"></span>listed / matched</div>
+      <div class="item"><span class="dot" style="background:var(--act-observe)"></span>observed in output</div>
+      <div class="hint">node size = access count · color = primary action</div>
     </div>
   </div>
   <aside id="details">
@@ -547,6 +751,25 @@ svg.call(zoom);
 let root = null;
 let initialTransform = null;
 
+// Color resolved from CSS custom properties so the palette stays in one place.
+const ACTION_COLORS = {
+  write:   "var(--act-write)",
+  edit:    "var(--act-edit)",
+  read:    "var(--act-read)",
+  bash:    "var(--act-bash)",
+  list:    "var(--act-list)",
+  observe: "var(--act-observe)",
+};
+const ACTION_LABELS = {
+  write: "written", edit: "edited", read: "read",
+  bash: "bash-touched", list: "listed", observe: "observed",
+};
+function colorFor(d) {
+  if (d.data.access) return ACTION_COLORS[d.data.access.primary] || "var(--act-observe)";
+  if (d.data.type === "dir") return "var(--dir)";
+  return "var(--untouched)";
+}
+
 function totalAccess(d) {
   // sum of access.count over node + descendants — used to size aggregate nodes
   let s = d.data.access ? d.data.access.count : 0;
@@ -565,9 +788,11 @@ function update(source) {
   nodes.forEach(n => { if (n.x < minX) minX = n.x; if (n.x > maxX) maxX = n.x; });
 
   const linkSel = gLinks.selectAll("path.link").data(links, d => d.target.data.path);
-  linkSel.enter().append("path")
+  const linkEnter = linkSel.enter().append("path")
+      .attr("class", d => "link" + (d.target.data.access ? " touched" : ""));
+  linkEnter.merge(linkSel)
       .attr("class", d => "link" + (d.target.data.access ? " touched" : ""))
-    .merge(linkSel)
+      .attr("stroke", d => d.target.data.access ? colorFor(d.target) : null)
       .attr("d", d3.linkHorizontal().x(d => d.y).y(d => d.x));
   linkSel.exit().remove();
 
@@ -589,11 +814,7 @@ function update(source) {
         if (t > 0) return 3 + Math.log2(t + 1) * 0.6;
         return 2.5;
       })
-      .attr("fill", d => {
-        if (d.data.access) return "var(--accent)";
-        if (d.data.type === "dir") return "var(--dir)";
-        return "var(--untouched)";
-      });
+      .attr("fill", colorFor);
 
   enter.append("text")
       .attr("dy", "0.32em")
@@ -603,11 +824,7 @@ function update(source) {
 
   const merged = enter.merge(nodeSel);
   merged.attr("transform", d => `translate(${d.y},${d.x})`);
-  merged.select("circle").attr("fill", d => {
-    if (d.data.access) return "var(--accent)";
-    if (d.data.type === "dir") return "var(--dir)";
-    return "var(--untouched)";
-  });
+  merged.select("circle").attr("fill", colorFor);
 
   nodeSel.exit().remove();
 
@@ -649,17 +866,36 @@ function showDetails(d) {
     body.innerHTML = `<dl><dt>type</dt><dd>${d.data.type}</dd><dt>touched</dt><dd>no</dd></dl>`;
     return;
   }
+  // Stacked bar showing the mix of actions that ever hit this path.
+  const total = Object.values(a.actions).reduce((s, n) => s + n, 0) || 1;
+  const order = ["write","edit","read","bash","list","observe"];
+  const bar = order
+    .filter(k => a.actions[k])
+    .map(k => `<div title="${ACTION_LABELS[k]} × ${a.actions[k]}"
+                    style="flex:${a.actions[k]};background:${ACTION_COLORS[k]}"></div>`)
+    .join("");
+  const actionRows = order
+    .filter(k => a.actions[k])
+    .map(k => `<li><span class="dot" style="background:${ACTION_COLORS[k]};
+                  display:inline-block;width:8px;height:8px;border-radius:50%;
+                  margin-right:6px;vertical-align:middle"></span>${ACTION_LABELS[k]} × ${a.actions[k]}</li>`)
+    .join("");
   const tools = Object.entries(a.tools).sort((x, y) => y[1] - x[1])
     .map(([t, n]) => `<li>${t} × ${n}</li>`).join("");
   const sessions = a.sessions.map(s => `<li>${s.slice(0, 8)}…</li>`).join("");
   const projects = a.projects.map(p => `<li>${p}</li>`).join("");
   body.innerHTML = `
+    <span class="primary-chip" style="background:${ACTION_COLORS[a.primary]}">
+      ${ACTION_LABELS[a.primary]}
+    </span>
+    <div class="action-bar">${bar}</div>
     <dl>
       <dt>type</dt><dd>${d.data.type}</dd>
       <dt>accesses</dt><dd>${a.count}</dd>
       <dt>last seen</dt><dd>${a.last_ts || "—"}</dd>
       <dt>sidechain</dt><dd>${a.sidechain}</dd>
     </dl>
+    <h2>Actions</h2><ul>${actionRows}</ul>
     <h2>Tools</h2><ul class="tools">${tools}</ul>
     <h2>Sessions</h2><ul>${sessions}</ul>
     <h2>Projects</h2><ul>${projects}</ul>
