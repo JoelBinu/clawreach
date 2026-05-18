@@ -1139,10 +1139,22 @@ FRONTEND_HTML = r"""<!doctype html>
     100% { box-shadow: 0 0 0 0 transparent; }
   }
   .viz-controls .recenter.flash { animation: flash-recenter .6s ease-out; }
-  .legend .item { display: flex; align-items: center; gap: 6px; }
+  .legend .item {
+    display: flex; align-items: center; gap: 6px;
+    cursor: pointer; user-select: none;
+    padding: 2px 4px; border-radius: 3px;
+    transition: opacity .15s, background .15s;
+  }
+  .legend .item:hover { background: var(--rule); }
+  .legend .item.off { opacity: .3; text-decoration: line-through; }
+  .legend .item.off:hover { opacity: .55; }
   .legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
   .legend .hint { grid-column: 1 / -1; color: var(--muted); margin-top: 4px;
                   padding-top: 4px; border-top: 1px solid var(--rule); }
+  .legend #legend-reset {
+    color: var(--accent-soft); cursor: pointer; margin-left: 8px;
+    text-decoration: underline; display: none;
+  }
 </style>
 </head>
 <body>
@@ -1192,13 +1204,15 @@ FRONTEND_HTML = r"""<!doctype html>
       <button id="recenter" class="recenter" title="Recenter view (R or 0)">⌂</button>
     </div>
     <div class="legend">
-      <div class="item"><span class="dot" style="background:var(--act-write)"></span>written / generated</div>
-      <div class="item"><span class="dot" style="background:var(--act-edit)"></span>edited in place</div>
-      <div class="item"><span class="dot" style="background:var(--act-read)"></span>read</div>
-      <div class="item"><span class="dot" style="background:var(--act-bash)"></span>bash-touched</div>
-      <div class="item"><span class="dot" style="background:var(--act-list)"></span>listed / matched</div>
-      <div class="item"><span class="dot" style="background:var(--act-observe)"></span>observed in output</div>
-      <div class="hint">node size = access count · color = primary action · press <kbd>R</kbd> to recenter</div>
+      <div class="item" data-action="write"   title="Toggle written nodes">  <span class="dot" style="background:var(--act-write)"></span>written / generated</div>
+      <div class="item" data-action="edit"    title="Toggle edited nodes">   <span class="dot" style="background:var(--act-edit)"></span>edited in place</div>
+      <div class="item" data-action="read"    title="Toggle read nodes">     <span class="dot" style="background:var(--act-read)"></span>read</div>
+      <div class="item" data-action="bash"    title="Toggle bash-touched">   <span class="dot" style="background:var(--act-bash)"></span>bash-touched</div>
+      <div class="item" data-action="list"    title="Toggle listed nodes">   <span class="dot" style="background:var(--act-list)"></span>listed / matched</div>
+      <div class="item" data-action="observe" title="Toggle observed nodes"> <span class="dot" style="background:var(--act-observe)"></span>observed in output</div>
+      <div class="hint">click a dot to filter · press <kbd>R</kbd> to recenter
+        <a id="legend-reset" title="Re-enable every action">show all</a>
+      </div>
     </div>
   </div>
   <aside id="details">
@@ -1245,12 +1259,24 @@ let playInterval = null;
 
 const ACTION_PRIORITY = { write:0, edit:1, read:2, bash:3, list:4, observe:5 };
 
+// All action names known to the frontend; must stay in sync with ACTIONS
+// in clawreach.py (and the data-action attributes in the legend markup).
+const ALL_ACTIONS = ["write", "edit", "read", "bash", "list", "observe"];
+
 function loadFilters() {
   try {
     const raw = localStorage.getItem("clawreach.filters");
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const p = JSON.parse(raw);
+      // Backward compat: missing keys default to null (= no constraint).
+      return {
+        sessions: p.sessions ?? null,
+        projects: p.projects ?? null,
+        actions:  p.actions  ?? null,
+      };
+    }
   } catch {}
-  return { sessions: null, projects: null };
+  return { sessions: null, projects: null, actions: null };
 }
 function saveFilters() {
   try { localStorage.setItem("clawreach.filters", JSON.stringify(filters)); } catch {}
@@ -1259,6 +1285,7 @@ function saveFilters() {
 function eventPasses(ev) {
   if (filters.sessions !== null && !filters.sessions.includes(ev.session)) return false;
   if (filters.projects !== null && !filters.projects.includes(ev.project)) return false;
+  if (filters.actions !== null && !filters.actions.includes(ev.action)) return false;
   // Time slider: when cutoff is at max we accept everything (incl. ts==max).
   if (timeMax > 0 && timeCutoff < timeMax && ev.ts) {
     const evMs = Date.parse(ev.ts);
@@ -1272,9 +1299,48 @@ function isFilterActive() {
       filters.sessions.length !== lastMeta.sessions.length) return true;
   if (filters.projects !== null && lastMeta &&
       filters.projects.length !== lastMeta.projects.length) return true;
+  if (filters.actions !== null && filters.actions.length !== ALL_ACTIONS.length) return true;
   if (timeMax > 0 && timeCutoff < timeMax) return true;
   return false;
 }
+
+// --- Legend filter wiring --------------------------------------------------
+// Click any colored dot to toggle that action; click "show all" to reset.
+function isActionEnabled(action) {
+  return filters.actions === null || filters.actions.includes(action);
+}
+
+function toggleAction(action) {
+  let next = filters.actions === null
+    ? ALL_ACTIONS.slice()                     // start from "everything on"
+    : filters.actions.slice();
+  const i = next.indexOf(action);
+  if (i >= 0) next.splice(i, 1); else next.push(action);
+  // Normalize: full set → null (so "no constraint" is the canonical state).
+  filters.actions = next.length === ALL_ACTIONS.length ? null : next;
+  saveFilters();
+  updateLegendVisuals();
+  applyFiltersAndRender();
+}
+
+function updateLegendVisuals() {
+  document.querySelectorAll(".legend .item[data-action]").forEach(el => {
+    el.classList.toggle("off", !isActionEnabled(el.dataset.action));
+  });
+  document.getElementById("legend-reset").style.display =
+    filters.actions === null ? "none" : "inline";
+}
+
+document.querySelectorAll(".legend .item[data-action]").forEach(el => {
+  el.onclick = () => toggleAction(el.dataset.action);
+});
+document.getElementById("legend-reset").onclick = (e) => {
+  e.preventDefault();
+  filters.actions = null;
+  saveFilters();
+  updateLegendVisuals();
+  applyFiltersAndRender();
+};
 
 // Build a hierarchy from a filtered event list. No filesystem access, so the
 // "+1 level of siblings" the server adds is lost — but for a deliberately
@@ -1778,6 +1844,7 @@ async function load(rescan) {
   renderFilterUI("sessions", meta.sessions || []);
   renderFilterUI("projects", meta.projects || []);
   updateFilterSummaries();
+  updateLegendVisuals();
   initTimeSlider(meta);
   // Unfiltered → use the server's tree (it includes sibling context the
   // client can't reconstruct without disk access). Otherwise rebuild locally.
