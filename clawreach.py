@@ -417,6 +417,7 @@ class PathStats:
     projects: set[str] = field(default_factory=set)
     sidechain_count: int = 0
     sensitive: bool = False  # any event for this path was sensitive
+    exists: bool = True      # whether the path is on disk right now
 
     def add(self, ev: AccessEvent) -> None:
         self.count += 1
@@ -454,6 +455,7 @@ class PathStats:
             "projects": sorted(self.projects),
             "sidechain": self.sidechain_count,
             "sensitive": self.sensitive,
+            "exists": self.exists,
         }
 
 
@@ -461,6 +463,14 @@ def aggregate(events: list[AccessEvent]) -> dict[str, PathStats]:
     stats: dict[str, PathStats] = {}
     for ev in events:
         stats.setdefault(ev.path, PathStats()).add(ev)
+    # One disk check per unique path. A path can be "touched" without existing
+    # — most often it's a Bash command argument that was a typo, a deleted
+    # file, or a literal example like /Users/jane/... appearing in dev tests.
+    for path, s in stats.items():
+        try:
+            s.exists = os.path.exists(path)
+        except OSError:
+            s.exists = False
     return stats
 
 
@@ -568,14 +578,17 @@ def _materialize(root: str, nodes: set[str], stats: dict[str, PathStats]) -> dic
 
     def node(path: str) -> dict:
         try:
-            is_dir = os.path.isdir(path)
+            exists_on_disk = os.path.exists(path)
+            is_dir = exists_on_disk and os.path.isdir(path)
         except OSError:
+            exists_on_disk = False
             is_dir = False
         st = stats.get(path)
         out: dict = {
             "name": os.path.basename(path) or path,
             "path": path,
             "type": "dir" if is_dir else "file",
+            "exists": exists_on_disk,
         }
         if st:
             out["access"] = st.to_dict()
@@ -680,6 +693,7 @@ class _Cache:
         self._lock = threading.Lock()
         self._tree: dict | None = None
         self._events: list[AccessEvent] = []
+        self._stats: dict[str, PathStats] = {}
         self._meta: dict = {}
         # SSE subscribers (one queue per connected client) + watcher thread.
         self._sse_subscribers: list["queue.Queue[dict]"] = []
@@ -732,7 +746,7 @@ class _Cache:
                             continue
                 if mtimes is not None and current != mtimes:
                     self.rescan()
-                    _, _, meta = self.get()
+                    _, _, meta, _ = self.get()
                     self._notify_subscribers({
                         "type": "tree-updated",
                         "scanned_at": meta.get("scanned_at"),
@@ -744,16 +758,16 @@ class _Cache:
                 sys.stderr.write(f"[clawreach] watcher error: {e}\n")
             time.sleep(interval)
 
-    def get(self) -> tuple[dict, list[AccessEvent], dict]:
+    def get(self) -> tuple[dict, list[AccessEvent], dict, dict[str, PathStats]]:
         with self._lock:
             if self._tree is None:
                 self._rescan_locked()
-            return self._tree, list(self._events), dict(self._meta)
+            return self._tree, list(self._events), dict(self._meta), self._stats
 
-    def rescan(self) -> tuple[dict, list[AccessEvent], dict]:
+    def rescan(self) -> tuple[dict, list[AccessEvent], dict, dict[str, PathStats]]:
         with self._lock:
             self._rescan_locked()
-            return self._tree, list(self._events), dict(self._meta)
+            return self._tree, list(self._events), dict(self._meta), self._stats
 
     def _rescan_locked(self) -> None:
         t0 = time.time()
@@ -762,12 +776,14 @@ class _Cache:
         tree = build_tree(stats, root=self.root, full_walk_root=self.full_walk_root)
         self._tree = tree
         self._events = events
+        self._stats = stats
         # Pre-compute the inputs the filter/slider UIs need so the frontend
         # doesn't have to walk every event to discover them.
         sessions = sorted({ev.session for ev in events if ev.session})
         projects = sorted({ev.project for ev in events if ev.project})
         timestamps = [ev.ts for ev in events if ev.ts]
         sensitive_paths = sorted({ev.path for ev in events if ev.sensitive})
+        missing_count = sum(1 for s in stats.values() if not s.exists)
         self._meta = {
             "event_count": len(events),
             "unique_paths": len(stats),
@@ -781,11 +797,17 @@ class _Cache:
             "time_max": max(timestamps) if timestamps else "",
             "sensitive_count": len(sensitive_paths),
             "sensitive_paths": sensitive_paths[:MAX_SENSITIVE_PATHS_IN_META],
+            "missing_count": missing_count,
         }
 
 
-def _events_to_wire(events: list[AccessEvent]) -> list[dict]:
-    """Compact event list for the wire. Skips booleans when False."""
+def _events_to_wire(events: list[AccessEvent],
+                    stats: dict[str, PathStats] | None = None) -> list[dict]:
+    """Compact event list for the wire. Skips booleans when False.
+
+    If `stats` is provided, each event whose path doesn't exist on disk
+    is tagged `missing: true` so the client can filter / style accordingly.
+    """
     out: list[dict] = []
     for ev in events:
         d = {
@@ -796,6 +818,10 @@ def _events_to_wire(events: list[AccessEvent]) -> list[dict]:
             d["sidechain"] = True
         if ev.sensitive:
             d["sensitive"] = True
+        if stats is not None:
+            s = stats.get(ev.path)
+            if s is not None and not s.exists:
+                d["missing"] = True
         out.append(d)
     return out
 
@@ -826,12 +852,12 @@ def make_handler(cache: _Cache, html: str):
                 self.wfile.write(body)
                 return
             if self.path == "/api/tree":
-                tree, events, meta = cache.get()
-                self._send_json({"tree": tree, "events": _events_to_wire(events), "meta": meta})
+                tree, events, meta, stats = cache.get()
+                self._send_json({"tree": tree, "events": _events_to_wire(events, stats), "meta": meta})
                 return
             if self.path == "/api/rescan":
-                tree, events, meta = cache.rescan()
-                self._send_json({"tree": tree, "events": _events_to_wire(events), "meta": meta})
+                tree, events, meta, stats = cache.rescan()
+                self._send_json({"tree": tree, "events": _events_to_wire(events, stats), "meta": meta})
                 return
             if self.path == "/api/events":
                 self._serve_sse()
@@ -854,7 +880,7 @@ def make_handler(cache: _Cache, html: str):
             # Walk the cache to find which sessions touched this path; try the
             # hinted session first, then the others — most recent first feels
             # right but PathStats.sessions is sorted alphabetically.
-            _, events, _ = cache.get()
+            _, events, _, _ = cache.get()
             sessions_for_path = sorted(
                 {ev.session for ev in events if ev.path == abs_path and ev.session},
                 reverse=True)  # roughly recent-first for uuid-prefixed session ids
@@ -1107,6 +1133,23 @@ FRONTEND_HTML = r"""<!doctype html>
     paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round;
   }
   .node.untouched text { fill: var(--muted); }
+  /* "Missing" = path was referenced by Claude (often in a Bash command)
+     but doesn't exist on disk right now. Dashed ring + italic name +
+     a "?" suffix make it obvious without removing it from the tree. */
+  .node.missing circle.main { stroke-dasharray: 2.5 2; stroke: var(--muted); }
+  .node.missing text {
+    font-style: italic; opacity: .75;
+  }
+  .node.missing text::after { content: " ?"; }
+  .toggle-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border: 1px solid var(--rule); border-radius: 4px;
+    background: var(--rule); cursor: pointer; user-select: none;
+    font: inherit; color: var(--ink);
+  }
+  .toggle-chip:hover { background: #232b38; }
+  .toggle-chip input { accent-color: var(--act-write); margin: 0; }
+  .toggle-chip .count { color: var(--muted); margin-left: 2px; }
   .link { fill: none; stroke: var(--rule); stroke-width: 1px; }
   .link.touched { stroke-opacity: .55; stroke-width: 1.4px; }
   .legend {
@@ -1186,6 +1229,10 @@ FRONTEND_HTML = r"""<!doctype html>
     <input type="range" id="time-slider" min="0" max="1000" value="1000" step="1">
     <span id="time-display">live</span>
   </div>
+  <label class="toggle-chip" title="Paths Claude referenced (often in Bash commands) that don't exist on disk">
+    <input type="checkbox" id="include-missing" checked>
+    Include missing<span class="count" id="missing-count"></span>
+  </label>
   <button id="rescan">Re-scan</button>
   <button id="reset">Reset view</button>
   <span class="meta" style="margin-left:auto">click a node to expand/collapse · drag to pan · scroll to zoom</span>
@@ -1268,15 +1315,16 @@ function loadFilters() {
     const raw = localStorage.getItem("clawreach.filters");
     if (raw) {
       const p = JSON.parse(raw);
-      // Backward compat: missing keys default to null (= no constraint).
+      // Backward compat: missing keys default (null = no constraint).
       return {
         sessions: p.sessions ?? null,
         projects: p.projects ?? null,
         actions:  p.actions  ?? null,
+        includeMissing: p.includeMissing !== false,  // default ON
       };
     }
   } catch {}
-  return { sessions: null, projects: null, actions: null };
+  return { sessions: null, projects: null, actions: null, includeMissing: true };
 }
 function saveFilters() {
   try { localStorage.setItem("clawreach.filters", JSON.stringify(filters)); } catch {}
@@ -1286,6 +1334,7 @@ function eventPasses(ev) {
   if (filters.sessions !== null && !filters.sessions.includes(ev.session)) return false;
   if (filters.projects !== null && !filters.projects.includes(ev.project)) return false;
   if (filters.actions !== null && !filters.actions.includes(ev.action)) return false;
+  if (!filters.includeMissing && ev.missing) return false;
   // Time slider: when cutoff is at max we accept everything (incl. ts==max).
   if (timeMax > 0 && timeCutoff < timeMax && ev.ts) {
     const evMs = Date.parse(ev.ts);
@@ -1300,6 +1349,7 @@ function isFilterActive() {
   if (filters.projects !== null && lastMeta &&
       filters.projects.length !== lastMeta.projects.length) return true;
   if (filters.actions !== null && filters.actions.length !== ALL_ACTIONS.length) return true;
+  if (!filters.includeMissing) return true;
   if (timeMax > 0 && timeCutoff < timeMax) return true;
   return false;
 }
@@ -1342,6 +1392,17 @@ document.getElementById("legend-reset").onclick = (e) => {
   applyFiltersAndRender();
 };
 
+// "Include missing" toggle — hides paths Claude referenced that don't exist.
+{
+  const cb = document.getElementById("include-missing");
+  cb.checked = filters.includeMissing;
+  cb.onchange = () => {
+    filters.includeMissing = cb.checked;
+    saveFilters();
+    applyFiltersAndRender();
+  };
+}
+
 // Build a hierarchy from a filtered event list. No filesystem access, so the
 // "+1 level of siblings" the server adds is lost — but for a deliberately
 // filtered view, the focused layout is usually what you want.
@@ -1355,7 +1416,8 @@ function buildTreeFromEvents(events) {
     let s = stats.get(ev.path);
     if (!s) {
       s = { count:0, last_ts:"", actions:{}, tools:{},
-            sessions:new Set(), projects:new Set(), sidechain:0, sensitive:false };
+            sessions:new Set(), projects:new Set(), sidechain:0, sensitive:false,
+            exists:true };
       stats.set(ev.path, s);
     }
     s.count++;
@@ -1366,6 +1428,7 @@ function buildTreeFromEvents(events) {
     if (ev.project) s.projects.add(ev.project);
     if (ev.sidechain) s.sidechain++;
     if (ev.sensitive) s.sensitive = true;
+    if (ev.missing) s.exists = false;
   }
   // Common-ancestor root.
   const paths = [...stats.keys()];
@@ -1405,6 +1468,9 @@ function buildTreeFromEvents(events) {
       name: path.substring(path.lastIndexOf("/") + 1) || path,
       path: path,
       type: kids.length > 0 ? "dir" : (path === rootPath ? "dir" : "file"),
+      // Ancestors not in our stats: assume they exist (a non-existent
+      // parent of an existing child would be impossible on a real disk).
+      exists: s ? s.exists : true,
     };
     if (s) {
       const primary = Object.keys(s.actions)
@@ -1414,7 +1480,7 @@ function buildTreeFromEvents(events) {
         count: s.count, last_ts: s.last_ts, primary,
         actions: s.actions, tools: s.tools,
         sessions: [...s.sessions].sort(), projects: [...s.projects].sort(),
-        sidechain: s.sidechain, sensitive: s.sensitive,
+        sidechain: s.sidechain, sensitive: s.sensitive, exists: s.exists,
       };
     }
     if (kids.length) node.children = kids.map(makeNode);
@@ -1584,7 +1650,11 @@ function update(source) {
 
   const nodeSel = gNodes.selectAll("g.node").data(nodes, d => d.data.path);
   const enter = nodeSel.enter().append("g")
-      .attr("class", d => "node" + (d.data.access ? " touched" : " untouched"))
+      .attr("class", d => {
+        let c = "node " + (d.data.access ? "touched" : "untouched");
+        if (d.data.exists === false) c += " missing";
+        return c;
+      })
       .attr("transform", d => `translate(${d.y},${d.x})`)
       .on("click", (_, d) => {
         if (d.children) { d._children = d.children; d.children = null; }
@@ -1775,6 +1845,8 @@ document.getElementById("diff-modal").addEventListener("click", (e) => {
 function setMeta(meta) {
   document.getElementById("meta").textContent =
     `${meta.event_count} events · ${meta.unique_paths} paths · root: ${meta.root} · scanned ${meta.scanned_at} (${meta.scan_ms}ms)`;
+  const mc = meta.missing_count || 0;
+  document.getElementById("missing-count").textContent = mc ? ` (${mc})` : "";
 }
 
 let sensitivePaths = [];
@@ -1975,14 +2047,14 @@ def main(argv: list[str] | None = None) -> int:
                    file_history_dir=args.file_history)
 
     if args.print_only:
-        tree, events, meta = cache.get()
-        json.dump({"tree": tree, "events": _events_to_wire(events), "meta": meta},
+        tree, events, meta, stats = cache.get()
+        json.dump({"tree": tree, "events": _events_to_wire(events, stats), "meta": meta},
                   sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0
 
     # Warm the cache up front so the first request is instant.
-    tree, _events, meta = cache.get()
+    tree, _events, meta, _stats = cache.get()
     print(f"[clawreach] {meta['event_count']} tool events across "
           f"{meta['unique_paths']} unique paths from {meta['transcripts_dir']}",
           file=sys.stderr)
