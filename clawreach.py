@@ -982,8 +982,16 @@ FRONTEND_HTML = r"""<!doctype html>
   body {
     background: var(--bg); color: var(--ink);
     font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-    display: grid; grid-template-rows: auto auto 1fr; overflow: hidden;
+    /* Three named rows so the alert hiding (display:none) doesn't cause
+       <main> to slide up into the auto row and collapse the viz area. */
+    display: grid;
+    grid-template-rows: [header] auto [alert] auto [main] 1fr;
+    grid-template-areas: "header" "alert" "main";
+    overflow: hidden;
   }
+  header  { grid-area: header; }
+  #alert  { grid-area: alert; }
+  main    { grid-area: main; }
   #alert {
     display: none;
     align-items: center; gap: 10px;
