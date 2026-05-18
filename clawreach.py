@@ -551,18 +551,19 @@ class _Cache:
         self.full_walk_root = full_walk_root
         self._lock = threading.Lock()
         self._tree: dict | None = None
+        self._events: list[AccessEvent] = []
         self._meta: dict = {}
 
-    def get(self) -> tuple[dict, dict]:
+    def get(self) -> tuple[dict, list[AccessEvent], dict]:
         with self._lock:
             if self._tree is None:
                 self._rescan_locked()
-            return self._tree, dict(self._meta)
+            return self._tree, list(self._events), dict(self._meta)
 
-    def rescan(self) -> tuple[dict, dict]:
+    def rescan(self) -> tuple[dict, list[AccessEvent], dict]:
         with self._lock:
             self._rescan_locked()
-            return self._tree, dict(self._meta)
+            return self._tree, list(self._events), dict(self._meta)
 
     def _rescan_locked(self) -> None:
         t0 = time.time()
@@ -570,6 +571,12 @@ class _Cache:
         stats = aggregate(events)
         tree = build_tree(stats, root=self.root, full_walk_root=self.full_walk_root)
         self._tree = tree
+        self._events = events
+        # Pre-compute the inputs the filter/slider UIs need so the frontend
+        # doesn't have to walk every event to discover them.
+        sessions = sorted({ev.session for ev in events if ev.session})
+        projects = sorted({ev.project for ev in events if ev.project})
+        timestamps = [ev.ts for ev in events if ev.ts]
         self._meta = {
             "event_count": len(events),
             "unique_paths": len(stats),
@@ -577,7 +584,25 @@ class _Cache:
             "root": tree.get("path", ""),
             "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "scan_ms": int((time.time() - t0) * 1000),
+            "sessions": sessions,
+            "projects": projects,
+            "time_min": min(timestamps) if timestamps else "",
+            "time_max": max(timestamps) if timestamps else "",
         }
+
+
+def _events_to_wire(events: list[AccessEvent]) -> list[dict]:
+    """Compact event list for the wire. Skips is_sidechain unless True."""
+    out: list[dict] = []
+    for ev in events:
+        d = {
+            "path": ev.path, "tool": ev.tool, "action": ev.action,
+            "ts": ev.ts, "session": ev.session, "project": ev.project,
+        }
+        if ev.is_sidechain:
+            d["sidechain"] = True
+        out.append(d)
+    return out
 
 
 def make_handler(cache: _Cache, html: str):
@@ -606,12 +631,12 @@ def make_handler(cache: _Cache, html: str):
                 self.wfile.write(body)
                 return
             if self.path == "/api/tree":
-                tree, meta = cache.get()
-                self._send_json({"tree": tree, "meta": meta})
+                tree, events, meta = cache.get()
+                self._send_json({"tree": tree, "events": _events_to_wire(events), "meta": meta})
                 return
             if self.path == "/api/rescan":
-                tree, meta = cache.rescan()
-                self._send_json({"tree": tree, "meta": meta})
+                tree, events, meta = cache.rescan()
+                self._send_json({"tree": tree, "events": _events_to_wire(events), "meta": meta})
                 return
             self.send_response(404)
             self.end_headers()
@@ -955,13 +980,14 @@ def main(argv: list[str] | None = None) -> int:
     cache = _Cache(args.projects, args.root, full_walk)
 
     if args.print_only:
-        tree, meta = cache.get()
-        json.dump({"tree": tree, "meta": meta}, sys.stdout, indent=2)
+        tree, events, meta = cache.get()
+        json.dump({"tree": tree, "events": _events_to_wire(events), "meta": meta},
+                  sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0
 
     # Warm the cache up front so the first request is instant.
-    tree, meta = cache.get()
+    tree, _events, meta = cache.get()
     print(f"[clawreach] {meta['event_count']} tool events across "
           f"{meta['unique_paths']} unique paths from {meta['transcripts_dir']}",
           file=sys.stderr)
