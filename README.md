@@ -4,6 +4,8 @@
 
 ClawReach parses your local [Claude Code](https://docs.claude.com/en/docs/claude-code) transcripts, extracts every file and directory the agent (and any subagents) touched, and renders the surrounding filesystem as a collapsible D3 tree. Each node is colored by what Claude did to it — **written, edited, read, bash-touched, listed, or observed in output** — so the signal is obvious at a glance.
 
+**v2 highlights:** sensitive-path audit (red banner when Claude touches `~/.ssh`, `*.env`, etc.) · time slider to replay a session · session/project filters · live auto-refresh via SSE · click any written/edited file to **diff exactly what Claude wrote** against the current state, using Claude Code's own file-history snapshots.
+
 ```
 ┌─ ClawReach ── 147 events · 52 paths · root: / ──────[Re-scan][Reset]──┐
 │                                                                       │
@@ -83,19 +85,30 @@ Three stages, all in one stdlib-only Python file:
 ```
 python3 clawreach.py [options]
 
-  --projects PATH    Transcripts directory (default: ~/.claude/projects)
-  --port N           HTTP port (default: 8765)
-  --host ADDR        Bind address (default: 127.0.0.1)
-  --root PATH        Override tree root (default: common ancestor of all accessed paths)
-  --full-walk DIR    Additionally walk this whole subtree (slow)
-  --full-home        Shortcut for --full-walk $HOME
-  --no-browser       Don't auto-open the browser
-  --print-only       Dump the JSON tree to stdout and exit (no server)
+  --projects PATH          Transcripts directory (default: ~/.claude/projects)
+  --file-history PATH      Snapshot dir for diff viewer (default: ~/.claude/file-history)
+  --port N                 HTTP port (default: 8765)
+  --host ADDR              Bind address (default: 127.0.0.1)
+  --root PATH              Override tree root (default: common ancestor of all accessed paths)
+  --full-walk DIR          Additionally walk this whole subtree (slow)
+  --full-home              Shortcut for --full-walk $HOME
+  --sensitive-patterns F   Custom regex list (one per line, # comments). Replaces defaults.
+  --no-watch               Disable file watcher (no SSE auto-refresh)
+  --watch-interval SEC     Watcher poll interval (default: 2.0)
+  --no-browser             Don't auto-open the browser
+  --print-only             Dump the JSON tree to stdout and exit (no server)
 ```
 
 ## API
 
-Two JSON endpoints, both return `{ "tree": <node>, "meta": <stats> }`.
+| Endpoint | Returns |
+|---|---|
+| `GET /api/tree` | `{tree, events, meta}` — full state |
+| `GET /api/rescan` | same, after re-ingesting |
+| `GET /api/events` | Server-Sent Events stream of `{"type":"tree-updated", "scanned_at", "event_count"}` deltas |
+| `GET /api/snapshot?path=<abs>&session=<hint>` | `{snapshot, current, diff, missing, session}` for the diff viewer |
+
+`/api/tree` and `/api/rescan` return `{tree: <node>, events: [...], meta: <stats>}`.
 
 A `<node>` is:
 
@@ -112,13 +125,16 @@ A `<node>` is:
     "tools":   { "Write": 1, "Read": 4, "Edit": 2 },
     "sessions": ["8e5900ea-..."],
     "projects": ["-Users-you-Desktop-ClawReach"],
-    "sidechain": 0
+    "sidechain": 0,
+    "sensitive": false             // matched a sensitive-path regex
   },
   "children": [ /* nested <node>s */ ]
 }
 ```
 
-`<meta>` contains `event_count`, `unique_paths`, `transcripts_dir`, `root`, `scanned_at`, `scan_ms`.
+`<meta>` contains: `event_count`, `unique_paths`, `transcripts_dir`, `root`, `scanned_at`, `scan_ms`, `sessions[]`, `projects[]`, `time_min`, `time_max`, `sensitive_count`, `sensitive_paths[]`.
+
+Events (`<wire-event>`) are compact: `{path, tool, action, ts, session, project, sidechain?, sensitive?}` — booleans are omitted when false.
 
 ## Caveats
 
