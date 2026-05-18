@@ -505,15 +505,16 @@ def build_tree(
     stats: dict[str, PathStats],
     *,
     root: str | None = None,
-    sibling_depth: int = 1,
+    sibling_depth: int = 0,
     full_walk_root: str | None = None,
 ) -> dict:
     """Build the nested tree.
 
     - All accessed paths and their ancestors up to `root` are included.
-    - For each accessed directory (or directory containing an accessed file),
-      one level of siblings is added so users see "what's next to the file
-      Claude touched."
+    - If `sibling_depth > 0`, one level of siblings is added around each
+      accessed directory (or directory containing an accessed file) so users
+      see "what's next to the file Claude touched." When 0 (the default), the
+      tree is just touched paths and the directories that connect them.
     - If full_walk_root is set, walk that whole subtree (ignoring noise dirs).
     """
     accessed = set(stats.keys())
@@ -534,21 +535,23 @@ def build_tree(
             if anc.startswith(root) or anc == root:
                 nodes.add(anc)
 
-    # Add siblings around each accessed dir / parent dir.
-    sibling_targets: set[str] = set()
-    for p in list(nodes):
-        d = p if os.path.isdir(p) else os.path.dirname(p)
-        sibling_targets.add(d)
-    for d in sibling_targets:
-        try:
-            for name in os.listdir(d):
-                if name in IGNORE_DIR_NAMES:
-                    continue
-                child = os.path.join(d, name)
-                if child.startswith(root):
-                    nodes.add(child)
-        except OSError:
-            continue
+    # Add siblings around each accessed dir / parent dir — only when asked.
+    # By default the tree stays focused on what Claude actually touched.
+    if sibling_depth > 0:
+        sibling_targets: set[str] = set()
+        for p in list(nodes):
+            d = p if os.path.isdir(p) else os.path.dirname(p)
+            sibling_targets.add(d)
+        for d in sibling_targets:
+            try:
+                for name in os.listdir(d):
+                    if name in IGNORE_DIR_NAMES:
+                        continue
+                    child = os.path.join(d, name)
+                    if child.startswith(root):
+                        nodes.add(child)
+            except OSError:
+                continue
 
     # Optionally walk a full subtree as well.
     if full_walk_root:
@@ -684,11 +687,13 @@ class _Cache:
 
     def __init__(self, projects_dir: Path, root: str | None, full_walk_root: str | None,
                  sensitive_patterns: list[str] | None = None,
-                 file_history_dir: Path | None = None):
+                 file_history_dir: Path | None = None,
+                 sibling_depth: int = 0):
         self.projects_dir = projects_dir
         self.root = root
         self.full_walk_root = full_walk_root
         self.sensitive_patterns = sensitive_patterns  # None → use defaults
+        self.sibling_depth = sibling_depth
         self.file_history_dir = file_history_dir or DEFAULT_FILE_HISTORY_DIR
         self._lock = threading.Lock()
         self._tree: dict | None = None
@@ -773,7 +778,8 @@ class _Cache:
         t0 = time.time()
         events = ingest_all(self.projects_dir, self.sensitive_patterns)
         stats = aggregate(events)
-        tree = build_tree(stats, root=self.root, full_walk_root=self.full_walk_root)
+        tree = build_tree(stats, root=self.root, sibling_depth=self.sibling_depth,
+                          full_walk_root=self.full_walk_root)
         self._tree = tree
         self._events = events
         self._stats = stats
@@ -1421,8 +1427,8 @@ document.getElementById("legend-reset").onclick = (e) => {
 }
 
 // Build a hierarchy from a filtered event list. No filesystem access, so the
-// "+1 level of siblings" the server adds is lost — but for a deliberately
-// filtered view, the focused layout is usually what you want.
+// "+1 level of siblings" the server adds under --siblings is lost — but for a
+// deliberately filtered view, the focused layout is usually what you want.
 function buildTreeFromEvents(events) {
   if (!events.length) {
     return { name: "(no events match filter)", path: "", type: "dir", children: [] };
@@ -2080,6 +2086,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default="127.0.0.1", help="Bind address (default: %(default)s)")
     ap.add_argument("--root", default=None,
                     help="Tree root. Defaults to common ancestor of all accessed paths.")
+    ap.add_argument("--siblings", action="store_true",
+                    help="Include one level of untouched siblings around touched paths "
+                         "for context. Default: off (touched paths and their ancestors only).")
     ap.add_argument("--full-walk", default=None, metavar="DIR",
                     help="Additionally walk this whole subtree (slow; e.g. ~ or /).")
     ap.add_argument("--full-home", action="store_true",
@@ -2112,7 +2121,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     cache = _Cache(args.projects, args.root, full_walk, sensitive_patterns,
-                   file_history_dir=args.file_history)
+                   file_history_dir=args.file_history,
+                   sibling_depth=1 if args.siblings else 0)
 
     if args.print_only:
         tree, events, meta, stats = cache.get()
