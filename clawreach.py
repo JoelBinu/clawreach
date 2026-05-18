@@ -1499,6 +1499,8 @@ function applyFiltersAndRender(opts = {}) {
   // On manual filter changes we re-fit so the focused view is centered.
   if (!opts.skipFit) initialTransform = null;
   update(root);
+  // Banner reflects the current view — recompute on every filter change.
+  setAlert();
 }
 
 function setTimeCutoff(ms, opts = {}) {
@@ -1850,12 +1852,32 @@ function setMeta(meta) {
 }
 
 let sensitivePaths = [];
-function setAlert(meta) {
-  sensitivePaths = meta.sensitive_paths || [];
+let sensitiveMissingPaths = new Set();
+// Derive the sensitive banner from the *currently filtered* events. That way
+// it always reflects what the user sees in the tree — uncheck "Include
+// missing" and the count drops to exclude paths that were merely mentioned.
+function setAlert() {
+  const filtered = lastEvents.filter(eventPasses);
+  const sensSet = new Set();
+  const missingSet = new Set();
+  for (const ev of filtered) {
+    if (ev.sensitive) {
+      sensSet.add(ev.path);
+      if (ev.missing) missingSet.add(ev.path);
+    }
+  }
+  sensitivePaths = [...sensSet].sort();
+  sensitiveMissingPaths = missingSet;
+  const n = sensitivePaths.length;
+  const realCount = n - missingSet.size;
   const alertEl = document.getElementById("alert");
-  if ((meta.sensitive_count || 0) > 0) {
+  if (n > 0) {
+    // Split count so the user can tell mentions from real accesses.
+    const breakdown = missingSet.size > 0
+      ? ` (${realCount} on disk, ${missingSet.size} only referenced)`
+      : "";
     document.getElementById("alert-text").textContent =
-      `Claude has touched ${meta.sensitive_count} sensitive path${meta.sensitive_count === 1 ? "" : "s"} — review.`;
+      `Claude has touched ${n} sensitive path${n === 1 ? "" : "s"}${breakdown} — review.`;
     alertEl.classList.add("visible");
   } else {
     alertEl.classList.remove("visible");
@@ -1894,11 +1916,19 @@ function focusPath(targetPath) {
 
 document.getElementById("alert-show").onclick = () => {
   if (!sensitivePaths.length) return;
-  // Open the sidebar with a clickable list of sensitive paths.
+  // Open the sidebar with a clickable list of sensitive paths. Missing
+  // (never-existed-on-disk) entries are dimmed + struck through so the user
+  // can immediately tell genuine accesses from heuristic mentions.
   document.getElementById("sel-path").textContent = `${sensitivePaths.length} sensitive paths`;
-  const listed = sensitivePaths.map(p =>
-    `<li><a href="#" data-path="${p.replace(/"/g, '&quot;')}" style="color:var(--danger-soft);text-decoration:none">${p}</a></li>`
-  ).join("");
+  const listed = sensitivePaths.map(p => {
+    const safe = p.replace(/"/g, '&quot;');
+    const isMissing = sensitiveMissingPaths.has(p);
+    const style = isMissing
+      ? "color:var(--muted);font-style:italic;text-decoration:line-through"
+      : "color:var(--danger-soft);text-decoration:none";
+    const tag = isMissing ? ' <span style="font-style:normal;color:var(--muted)">(not on disk)</span>' : "";
+    return `<li><a href="#" data-path="${safe}" style="${style}">${p}</a>${tag}</li>`;
+  }).join("");
   document.getElementById("sel-body").innerHTML = `<ul style="list-style:none;padding:0">${listed}</ul>`;
   document.querySelectorAll("#sel-body a[data-path]").forEach(a => {
     a.onclick = (e) => { e.preventDefault(); focusPath(a.dataset.path); };
@@ -1911,7 +1941,7 @@ async function load(rescan) {
   lastEvents = events || [];
   lastMeta = meta;
   setMeta(meta);
-  setAlert(meta);
+  setAlert();
   // Render the filter UIs against the new option lists.
   renderFilterUI("sessions", meta.sessions || []);
   renderFilterUI("projects", meta.projects || []);
