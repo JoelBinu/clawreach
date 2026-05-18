@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import shlex
 import sys
@@ -584,7 +585,11 @@ def _materialize(root: str, nodes: set[str], stats: dict[str, PathStats]) -> dic
 # ---------------------------------------------------------------------------
 
 class _Cache:
-    """Thread-safe cache of the last scan. Re-scans on demand."""
+    """Thread-safe cache of the last scan. Re-scans on demand.
+
+    Optionally runs a background thread that polls JSONL mtimes and triggers
+    re-scans + SSE notifications when transcripts change on disk.
+    """
 
     def __init__(self, projects_dir: Path, root: str | None, full_walk_root: str | None,
                  sensitive_patterns: list[str] | None = None):
@@ -596,6 +601,68 @@ class _Cache:
         self._tree: dict | None = None
         self._events: list[AccessEvent] = []
         self._meta: dict = {}
+        # SSE subscribers (one queue per connected client) + watcher thread.
+        self._sse_subscribers: list["queue.Queue[dict]"] = []
+        self._sse_lock = threading.Lock()
+        self._watch_thread: threading.Thread | None = None
+
+    # --- SSE plumbing -------------------------------------------------------
+    def add_subscriber(self) -> "queue.Queue[dict]":
+        q: "queue.Queue[dict]" = queue.Queue(maxsize=8)
+        with self._sse_lock:
+            self._sse_subscribers.append(q)
+        return q
+
+    def remove_subscriber(self, q: "queue.Queue[dict]") -> None:
+        with self._sse_lock:
+            try:
+                self._sse_subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def _notify_subscribers(self, msg: dict) -> None:
+        with self._sse_lock:
+            subs = list(self._sse_subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                # Slow consumer — drop. They'll catch up on the next event.
+                pass
+
+    # --- Watcher ------------------------------------------------------------
+    def start_watch(self, interval: float = 2.0) -> None:
+        if self._watch_thread is not None:
+            return
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop, args=(interval,), daemon=True,
+            name="clawreach-watch")
+        self._watch_thread.start()
+
+    def _watch_loop(self, interval: float) -> None:
+        mtimes: dict[str, float] | None = None
+        while True:
+            try:
+                current: dict[str, float] = {}
+                if self.projects_dir.exists():
+                    for j in self.projects_dir.rglob("*.jsonl"):
+                        try:
+                            current[str(j)] = j.stat().st_mtime
+                        except OSError:
+                            continue
+                if mtimes is not None and current != mtimes:
+                    self.rescan()
+                    _, _, meta = self.get()
+                    self._notify_subscribers({
+                        "type": "tree-updated",
+                        "scanned_at": meta.get("scanned_at"),
+                        "event_count": meta.get("event_count"),
+                    })
+                mtimes = current
+            except Exception as e:
+                # Don't let one bad iteration kill the watcher.
+                sys.stderr.write(f"[clawreach] watcher error: {e}\n")
+            time.sleep(interval)
 
     def get(self) -> tuple[dict, list[AccessEvent], dict]:
         with self._lock:
@@ -686,8 +753,40 @@ def make_handler(cache: _Cache, html: str):
                 tree, events, meta = cache.rescan()
                 self._send_json({"tree": tree, "events": _events_to_wire(events), "meta": meta})
                 return
+            if self.path == "/api/events":
+                self._serve_sse()
+                return
             self.send_response(404)
             self.end_headers()
+
+        def _serve_sse(self):
+            """Stream cache events to the client until they disconnect."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
+            self.end_headers()
+            q = cache.add_subscriber()
+            try:
+                # Hello so the client knows the stream is live.
+                self.wfile.write(b"data: {\"type\":\"hello\"}\n\n")
+                self.wfile.flush()
+                while True:
+                    try:
+                        msg = q.get(timeout=15.0)
+                    except queue.Empty:
+                        # Comment-only line is a keep-alive per the SSE spec.
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        continue
+                    body = b"data: " + json.dumps(msg).encode("utf-8") + b"\n\n"
+                    self.wfile.write(body)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # client went away
+            finally:
+                cache.remove_subscriber(q)
 
     return Handler
 
@@ -1421,6 +1520,25 @@ async function load(rescan) {
 
 document.getElementById("rescan").onclick = () => load(true);
 document.getElementById("reset").onclick = () => { initialTransform = null; update(root); };
+
+// Watch mode: listen for tree-updated SSE events and re-fetch.
+// Suppressed during playback so the user's animation isn't interrupted.
+let sseSource = null;
+function startSse() {
+  if (sseSource) sseSource.close();
+  try {
+    sseSource = new EventSource("/api/events");
+  } catch { return; }
+  sseSource.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === "tree-updated" && !isPlaying) load(false);
+    } catch {}
+  };
+  // EventSource auto-reconnects on transient errors; nothing to do.
+}
+startSse();
+
 load(false);
 </script>
 </body>
@@ -1450,6 +1568,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sensitive-patterns", type=Path, default=None, metavar="FILE",
                     help="Path to a file with custom sensitive-path regexes (one per line, "
                          "# for comments). Replaces the built-in list.")
+    ap.add_argument("--no-watch", action="store_true",
+                    help="Disable the file watcher (no auto-refresh on transcript changes).")
+    ap.add_argument("--watch-interval", type=float, default=2.0, metavar="SEC",
+                    help="Watcher poll interval (default: %(default)s seconds).")
     args = ap.parse_args(argv)
 
     full_walk = args.full_walk
@@ -1484,6 +1606,11 @@ def main(argv: list[str] | None = None) -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}/"
     print(f"[clawreach] serving at {url}", file=sys.stderr)
+
+    if not args.no_watch:
+        cache.start_watch(interval=args.watch_interval)
+        print(f"[clawreach] watching {args.projects} (poll every {args.watch_interval}s)",
+              file=sys.stderr)
 
     if not args.no_browser:
         threading.Thread(target=lambda: (time.sleep(0.3), webbrowser.open(url)), daemon=True).start()
