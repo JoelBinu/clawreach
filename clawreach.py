@@ -1504,18 +1504,16 @@ function applyFiltersAndRender(opts = {}) {
   root = d3.hierarchy(treeData);
   root.x0 = 0; root.y0 = 0;
   collapseUntouched(root);
-  // Default: keep the user's current zoom/pan. Filter changes are
-  // "show me a subset" — they shouldn't yank the camera around (which
-  // also caused a reflow loop with the sensitive banner show/hiding).
-  // Force a re-fit only when explicitly asked OR when the filtered set
-  // is empty (otherwise the user would be left staring at blank space).
-  if (opts.fit || filtered.length === 0) initialTransform = null;
-  update(root);
-  // Banner reflects the current view — recompute on every filter change.
+  // Default: re-fit so the filtered tree fills the viewport. Time-slider
+  // playback overrides with skipFit so the camera doesn't jump every tick.
+  if (!opts.skipFit) initialTransform = null;
+  // Update banner BEFORE update() so layout reflow (banner show/hide)
+  // happens before the fit measures clientHeight.
   setAlert();
+  update(root);
 }
 
-function setTimeCutoff(ms) {
+function setTimeCutoff(ms, opts = {}) {
   timeCutoff = ms;
   const slider = document.getElementById("time-slider");
   slider.value = ms;
@@ -1524,7 +1522,7 @@ function setTimeCutoff(ms) {
     new Date(ms).toLocaleString(undefined, { month: "short", day: "2-digit",
                                               hour: "2-digit", minute: "2-digit",
                                               second: "2-digit" });
-  applyFiltersAndRender();
+  applyFiltersAndRender(opts);
 }
 
 function initTimeSlider(meta) {
@@ -1554,12 +1552,13 @@ function togglePlay() {
   btn.textContent = isPlaying ? "⏸" : "▶";
   if (isPlaying) {
     // If we're at the end, rewind to the start before playing.
-    if (timeCutoff >= timeMax) setTimeCutoff(timeMin);
+    if (timeCutoff >= timeMax) setTimeCutoff(timeMin, { skipFit: true });
     // ~10 ticks/sec, advancing ~2% of the range per tick → ~5s playback.
     const stepSize = Math.max(1, Math.floor((timeMax - timeMin) / 50));
     playInterval = setInterval(() => {
       const next = Math.min(timeMax, timeCutoff + stepSize);
-      setTimeCutoff(next);
+      // skipFit during playback: re-fitting every tick would jitter the camera.
+      setTimeCutoff(next, { skipFit: true });
       if (next >= timeMax) togglePlay();  // auto-pause at end
     }, 100);
   } else {
@@ -1713,22 +1712,30 @@ function update(source) {
   nodeSel.exit().remove();
 
   if (initialTransform === null) {
-    const bbox = gZoom.node().getBBox();
-    const w = svg.node().clientWidth, h = svg.node().clientHeight;
-    // Bail on degenerate inputs — a tiny viewport (layout not settled) or
-    // an empty bbox (no nodes) used to produce a broken transform and a
-    // tree that visibly shrank with each render.
-    if (w < 20 || h < 20 || bbox.width < 1 || bbox.height < 1) {
-      initialTransform = d3.zoomIdentity;
-      svg.call(zoom.transform, initialTransform);
-      return;
-    }
-    const scale = Math.min(1, (w - 40) / bbox.width, (h - 40) / bbox.height);
-    const tx = 20 - bbox.x * scale;
-    const ty = (h - bbox.height * scale) / 2 - bbox.y * scale;
-    initialTransform = d3.zoomIdentity.translate(tx, ty).scale(scale);
-    svg.call(zoom.transform, initialTransform);
+    // Defer the actual fit to the next animation frame so any in-flight
+    // CSS class change (e.g. the sensitive banner toggling visibility)
+    // has time to reflow. Otherwise we'd measure clientHeight from the
+    // *previous* layout and produce a too-small or off-center fit.
+    requestAnimationFrame(fitToView);
   }
+}
+
+let fitScheduled = false;
+function fitToView() {
+  if (initialTransform !== null) return;  // someone fit already
+  fitScheduled = false;
+  const bbox = gZoom.node().getBBox();
+  const w = svg.node().clientWidth, h = svg.node().clientHeight;
+  if (w < 20 || h < 20 || bbox.width < 1 || bbox.height < 1) {
+    initialTransform = d3.zoomIdentity;
+    svg.call(zoom.transform, initialTransform);
+    return;
+  }
+  const scale = Math.min(1, (w - 40) / bbox.width, (h - 40) / bbox.height);
+  const tx = 20 - bbox.x * scale;
+  const ty = (h - bbox.height * scale) / 2 - bbox.y * scale;
+  initialTransform = d3.zoomIdentity.translate(tx, ty).scale(scale);
+  svg.call(zoom.transform, initialTransform);
 }
 
 function collapseUntouched(d) {
@@ -1977,10 +1984,10 @@ async function load(rescan) {
     initialTransform = null;
     update(root);
   } else {
-    // Initial / reload render of a filtered view — fit it once so the
-    // user sees their saved filter actually applied. Subsequent filter
-    // toggles preserve the viewport.
-    applyFiltersAndRender({ fit: true });
+    // applyFiltersAndRender auto-fits by default; that's correct here
+    // (initial render of saved filters) and also matches user expectation
+    // on subsequent filter changes.
+    applyFiltersAndRender();
   }
 }
 
