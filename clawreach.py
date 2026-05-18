@@ -1097,9 +1097,18 @@ FRONTEND_HTML = r"""<!doctype html>
     border-bottom: 1px solid var(--rule); margin-bottom: 4px;
   }
   .filter-body .actions a { color: var(--accent-soft); cursor: pointer; font-size: 11px; }
-  main { display: grid; grid-template-columns: 1fr 320px; min-height: 0; }
+  main {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    /* Explicit row that fills the parent. Without this, the implicit row
+       sizes to content — and the SVG's intrinsic size is only 300×150,
+       collapsing the viz area to a ~150px sliver at the top of the page. */
+    grid-template-rows: minmax(0, 1fr);
+    min-height: 0;
+  }
+  #viz, aside { min-height: 0; min-width: 0; }
   #viz { position: relative; overflow: hidden; }
-  #viz svg { width: 100%; height: 100%; cursor: grab; }
+  #viz svg { width: 100%; height: 100%; display: block; cursor: grab; }
   #viz svg:active { cursor: grabbing; }
   aside {
     border-left: 1px solid var(--rule); background: var(--panel);
