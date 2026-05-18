@@ -87,6 +87,28 @@ ABS_PATH_IN_TEXT_RE = re.compile(r"(?:^|[\s'\"`(\[])(/[\w./\-+@:%]{2,})")
 # like a recursive `ls` or a noisy `npm install`.
 MAX_MINED_PATHS_PER_RESULT = 100
 
+# Paths Claude probably shouldn't be in. Surfaces in the UI as a red ring on
+# the node and a banner count at the top of the page. Override with
+# --sensitive-patterns FILE (one regex per line).
+DEFAULT_SENSITIVE_PATTERNS = [
+    r"(^|/)\.ssh(/|$)",
+    r"(^|/)\.aws(/|$)",
+    r"(^|/)\.gnupg(/|$)",
+    r"(^|/)\.config/gh/",
+    r"/Library/Keychains/",
+    r"\.env(\.|$)",
+    r"\.pem$",
+    r"\.key$",
+    r"id_(rsa|ed25519|ecdsa|dsa)(\.|$)",
+    r"credentials?",
+    r"secret",
+    r"\btoken\b",
+    r"\bpassword\b",
+    r"\bprivate[_-]?key\b",
+]
+# Cap how many sensitive paths we ship for the banner's click-to-jump list.
+MAX_SENSITIVE_PATHS_IN_META = 50
+
 
 # ---------------------------------------------------------------------------
 # Ingest — parse JSONL transcripts into AccessEvent records
@@ -101,6 +123,7 @@ class AccessEvent:
     session: str
     project: str     # the encoded project dir name (= cwd with / → -)
     is_sidechain: bool  # True if a subagent issued the call
+    sensitive: bool = False  # matched a SENSITIVE_PATTERN — set in ingest_all
 
 
 def _expand(p: str, base: str | None = None) -> str | None:
@@ -345,8 +368,9 @@ def _mine_result_paths(src_tool: str, text: str, cwd: str | None) -> list[tuple[
     return out
 
 
-def ingest_all(projects_dir: Path) -> list[AccessEvent]:
-    """Parse every transcript under projects_dir."""
+def ingest_all(projects_dir: Path,
+               sensitive_patterns: list[str] | None = None) -> list[AccessEvent]:
+    """Parse every transcript under projects_dir; tag sensitive paths in place."""
     events: list[AccessEvent] = []
     if not projects_dir.exists():
         return events
@@ -355,7 +379,20 @@ def ingest_all(projects_dir: Path) -> list[AccessEvent]:
             events.extend(parse_transcript(jsonl))
         except OSError:
             continue
+    matcher = _compile_sensitive(sensitive_patterns or DEFAULT_SENSITIVE_PATTERNS)
+    if matcher is not None:
+        for ev in events:
+            if matcher.search(ev.path):
+                ev.sensitive = True
     return events
+
+
+def _compile_sensitive(patterns: list[str]) -> "re.Pattern | None":
+    """Combine patterns into one case-insensitive regex; None if list is empty."""
+    cleaned = [p for p in (s.strip() for s in patterns) if p and not p.startswith("#")]
+    if not cleaned:
+        return None
+    return re.compile("|".join(f"(?:{p})" for p in cleaned), re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +408,7 @@ class PathStats:
     sessions: set[str] = field(default_factory=set)
     projects: set[str] = field(default_factory=set)
     sidechain_count: int = 0
+    sensitive: bool = False  # any event for this path was sensitive
 
     def add(self, ev: AccessEvent) -> None:
         self.count += 1
@@ -382,6 +420,8 @@ class PathStats:
         self.projects.add(ev.project)
         if ev.is_sidechain:
             self.sidechain_count += 1
+        if ev.sensitive:
+            self.sensitive = True
 
     @property
     def primary_action(self) -> str:
@@ -405,6 +445,7 @@ class PathStats:
             "sessions": sorted(self.sessions),
             "projects": sorted(self.projects),
             "sidechain": self.sidechain_count,
+            "sensitive": self.sensitive,
         }
 
 
@@ -545,10 +586,12 @@ def _materialize(root: str, nodes: set[str], stats: dict[str, PathStats]) -> dic
 class _Cache:
     """Thread-safe cache of the last scan. Re-scans on demand."""
 
-    def __init__(self, projects_dir: Path, root: str | None, full_walk_root: str | None):
+    def __init__(self, projects_dir: Path, root: str | None, full_walk_root: str | None,
+                 sensitive_patterns: list[str] | None = None):
         self.projects_dir = projects_dir
         self.root = root
         self.full_walk_root = full_walk_root
+        self.sensitive_patterns = sensitive_patterns  # None → use defaults
         self._lock = threading.Lock()
         self._tree: dict | None = None
         self._events: list[AccessEvent] = []
@@ -567,7 +610,7 @@ class _Cache:
 
     def _rescan_locked(self) -> None:
         t0 = time.time()
-        events = ingest_all(self.projects_dir)
+        events = ingest_all(self.projects_dir, self.sensitive_patterns)
         stats = aggregate(events)
         tree = build_tree(stats, root=self.root, full_walk_root=self.full_walk_root)
         self._tree = tree
@@ -577,6 +620,7 @@ class _Cache:
         sessions = sorted({ev.session for ev in events if ev.session})
         projects = sorted({ev.project for ev in events if ev.project})
         timestamps = [ev.ts for ev in events if ev.ts]
+        sensitive_paths = sorted({ev.path for ev in events if ev.sensitive})
         self._meta = {
             "event_count": len(events),
             "unique_paths": len(stats),
@@ -588,11 +632,13 @@ class _Cache:
             "projects": projects,
             "time_min": min(timestamps) if timestamps else "",
             "time_max": max(timestamps) if timestamps else "",
+            "sensitive_count": len(sensitive_paths),
+            "sensitive_paths": sensitive_paths[:MAX_SENSITIVE_PATHS_IN_META],
         }
 
 
 def _events_to_wire(events: list[AccessEvent]) -> list[dict]:
-    """Compact event list for the wire. Skips is_sidechain unless True."""
+    """Compact event list for the wire. Skips booleans when False."""
     out: list[dict] = []
     for ev in events:
         d = {
@@ -601,6 +647,8 @@ def _events_to_wire(events: list[AccessEvent]) -> list[dict]:
         }
         if ev.is_sidechain:
             d["sidechain"] = True
+        if ev.sensitive:
+            d["sensitive"] = True
         out.append(d)
     return out
 
@@ -670,14 +718,33 @@ FRONTEND_HTML = r"""<!doctype html>
     --act-bash:    #b88cff;  /* purple  — shell-touched        */
     --act-list:    #5b7cff;  /* blue    — listed / matched     */
     --act-observe: #6b7280;  /* grey    — surfaced in output   */
+    --danger: #ef4444;       /* sensitive-path callouts        */
+    --danger-soft: #fca5a5;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--bg); color: var(--ink);
     font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-    display: grid; grid-template-rows: auto 1fr; overflow: hidden;
+    display: grid; grid-template-rows: auto auto 1fr; overflow: hidden;
   }
+  #alert {
+    display: none;
+    align-items: center; gap: 10px;
+    padding: 8px 16px;
+    background: rgba(239, 68, 68, .12);
+    border-bottom: 1px solid var(--danger);
+    color: var(--danger-soft);
+    font-size: 12px;
+  }
+  #alert.visible { display: flex; }
+  #alert .icon { font-size: 14px; }
+  #alert button {
+    background: transparent; border: 1px solid var(--danger);
+    color: var(--danger-soft); padding: 3px 10px; border-radius: 3px;
+    font: inherit; cursor: pointer;
+  }
+  #alert button:hover { background: rgba(239,68,68,.18); }
   header {
     display: flex; align-items: center; gap: 16px;
     padding: 10px 16px; border-bottom: 1px solid var(--rule);
@@ -704,6 +771,12 @@ FRONTEND_HTML = r"""<!doctype html>
   aside .primary-chip {
     display: inline-block; padding: 2px 8px; border-radius: 3px;
     font-size: 11px; margin-bottom: 10px; color: #0b0d11; font-weight: 600;
+    letter-spacing: .5px; text-transform: uppercase;
+  }
+  aside .sensitive-chip {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 11px; margin-bottom: 10px; margin-left: 6px;
+    color: var(--danger-soft); border: 1px solid var(--danger); font-weight: 600;
     letter-spacing: .5px; text-transform: uppercase;
   }
   .action-bar { display: flex; gap: 4px; height: 8px; margin: 4px 0 12px;
@@ -742,6 +815,11 @@ FRONTEND_HTML = r"""<!doctype html>
   <button id="reset">Reset view</button>
   <span class="meta" style="margin-left:auto">click a node to expand/collapse · drag to pan · scroll to zoom</span>
 </header>
+<div id="alert">
+  <span class="icon">⚠</span>
+  <span id="alert-text"></span>
+  <button id="alert-show">Show all</button>
+</div>
 <main>
   <div id="viz">
     <svg></svg>
@@ -833,6 +911,7 @@ function update(source) {
       });
 
   enter.append("circle")
+      .attr("class", "main")
       .attr("r", d => {
         const t = totalAccess(d);
         if (d.data.access) return Math.min(10, 3 + Math.log2(d.data.access.count + 1) * 1.6);
@@ -840,6 +919,19 @@ function update(source) {
         return 2.5;
       })
       .attr("fill", colorFor);
+
+  // Sensitive paths get a red ring around the main circle.
+  enter.filter(d => d.data.access && d.data.access.sensitive)
+      .append("circle")
+      .attr("class", "sensitive-ring")
+      .attr("r", d => {
+        const base = d.data.access
+          ? Math.min(10, 3 + Math.log2(d.data.access.count + 1) * 1.6) : 4;
+        return base + 3.5;
+      })
+      .attr("fill", "none")
+      .attr("stroke", "var(--danger)")
+      .attr("stroke-width", 1.4);
 
   enter.append("text")
       .attr("dy", "0.32em")
@@ -849,7 +941,7 @@ function update(source) {
 
   const merged = enter.merge(nodeSel);
   merged.attr("transform", d => `translate(${d.y},${d.x})`);
-  merged.select("circle").attr("fill", colorFor);
+  merged.select("circle.main").attr("fill", colorFor);
 
   nodeSel.exit().remove();
 
@@ -909,10 +1001,12 @@ function showDetails(d) {
     .map(([t, n]) => `<li>${t} × ${n}</li>`).join("");
   const sessions = a.sessions.map(s => `<li>${s.slice(0, 8)}…</li>`).join("");
   const projects = a.projects.map(p => `<li>${p}</li>`).join("");
+  const sensChip = a.sensitive
+    ? `<span class="sensitive-chip">⚠ sensitive</span>` : "";
   body.innerHTML = `
     <span class="primary-chip" style="background:${ACTION_COLORS[a.primary]}">
       ${ACTION_LABELS[a.primary]}
-    </span>
+    </span>${sensChip}
     <div class="action-bar">${bar}</div>
     <dl>
       <dt>type</dt><dd>${d.data.type}</dd>
@@ -932,10 +1026,67 @@ function setMeta(meta) {
     `${meta.event_count} events · ${meta.unique_paths} paths · root: ${meta.root} · scanned ${meta.scanned_at} (${meta.scan_ms}ms)`;
 }
 
+let sensitivePaths = [];
+function setAlert(meta) {
+  sensitivePaths = meta.sensitive_paths || [];
+  const alertEl = document.getElementById("alert");
+  if ((meta.sensitive_count || 0) > 0) {
+    document.getElementById("alert-text").textContent =
+      `Claude has touched ${meta.sensitive_count} sensitive path${meta.sensitive_count === 1 ? "" : "s"} — review.`;
+    alertEl.classList.add("visible");
+  } else {
+    alertEl.classList.remove("visible");
+  }
+}
+
+// Walk the d3 hierarchy to find a node by absolute path; expand ancestors,
+// scroll/zoom to it, and open the sidebar.
+function focusPath(targetPath) {
+  if (!root) return;
+  let found = null;
+  function walk(d) {
+    if (found) return;
+    if (d.data.path === targetPath) { found = d; return; }
+    const kids = (d.children || []).concat(d._children || []);
+    for (const k of kids) walk(k);
+  }
+  walk(root);
+  if (!found) return;
+  // Expand ancestors
+  for (let p = found.parent; p; p = p.parent) {
+    if (p._children) { p.children = p._children; p._children = null; }
+  }
+  update(found);
+  showDetails(found);
+  // Pan/zoom to bring the node roughly to center.
+  setTimeout(() => {
+    const t = d3.zoomTransform(svg.node());
+    const w = svg.node().clientWidth, h = svg.node().clientHeight;
+    const tx = w / 2 - found.y * t.k;
+    const ty = h / 2 - found.x * t.k;
+    svg.transition().duration(450).call(zoom.transform,
+      d3.zoomIdentity.translate(tx, ty).scale(t.k));
+  }, 50);
+}
+
+document.getElementById("alert-show").onclick = () => {
+  if (!sensitivePaths.length) return;
+  // Open the sidebar with a clickable list of sensitive paths.
+  document.getElementById("sel-path").textContent = `${sensitivePaths.length} sensitive paths`;
+  const listed = sensitivePaths.map(p =>
+    `<li><a href="#" data-path="${p.replace(/"/g, '&quot;')}" style="color:var(--danger-soft);text-decoration:none">${p}</a></li>`
+  ).join("");
+  document.getElementById("sel-body").innerHTML = `<ul style="list-style:none;padding:0">${listed}</ul>`;
+  document.querySelectorAll("#sel-body a[data-path]").forEach(a => {
+    a.onclick = (e) => { e.preventDefault(); focusPath(a.dataset.path); };
+  });
+};
+
 async function load(rescan) {
   const r = await fetch(rescan ? "/api/rescan" : "/api/tree");
   const { tree: data, meta } = await r.json();
   setMeta(meta);
+  setAlert(meta);
   root = d3.hierarchy(data);
   root.x0 = 0; root.y0 = 0;
   collapseUntouched(root);
@@ -971,13 +1122,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser.")
     ap.add_argument("--print-only", action="store_true",
                     help="Dump the JSON tree to stdout and exit (skip the server).")
+    ap.add_argument("--sensitive-patterns", type=Path, default=None, metavar="FILE",
+                    help="Path to a file with custom sensitive-path regexes (one per line, "
+                         "# for comments). Replaces the built-in list.")
     args = ap.parse_args(argv)
 
     full_walk = args.full_walk
     if args.full_home and not full_walk:
         full_walk = str(Path.home())
 
-    cache = _Cache(args.projects, args.root, full_walk)
+    sensitive_patterns: list[str] | None = None
+    if args.sensitive_patterns:
+        try:
+            sensitive_patterns = args.sensitive_patterns.read_text().splitlines()
+        except OSError as e:
+            print(f"[clawreach] could not read --sensitive-patterns: {e}", file=sys.stderr)
+            return 2
+
+    cache = _Cache(args.projects, args.root, full_walk, sensitive_patterns)
 
     if args.print_only:
         tree, events, meta = cache.get()
