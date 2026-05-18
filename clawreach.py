@@ -537,6 +537,29 @@ def _common_root(paths: Iterable[str]) -> str:
         return "/"
 
 
+def _collect_siblings(nodes: set[str], root: str) -> set[str]:
+    """For every dir in `nodes` (or parent of a file in `nodes`), return its
+    immediate on-disk children — i.e. the untouched neighbors of each known
+    path. Skips ignore-dir names; never returns paths outside `root`.
+    """
+    sibling_targets: set[str] = set()
+    for p in nodes:
+        d = p if os.path.isdir(p) else os.path.dirname(p)
+        sibling_targets.add(d)
+    out: set[str] = set()
+    for d in sibling_targets:
+        try:
+            for name in os.listdir(d):
+                if name in IGNORE_DIR_NAMES:
+                    continue
+                child = os.path.join(d, name)
+                if child.startswith(root):
+                    out.add(child)
+        except OSError:
+            continue
+    return out
+
+
 def build_tree(
     stats: dict[str, PathStats],
     *,
@@ -574,20 +597,7 @@ def build_tree(
     # Add siblings around each accessed dir / parent dir — only when asked.
     # By default the tree stays focused on what Claude actually touched.
     if sibling_depth > 0:
-        sibling_targets: set[str] = set()
-        for p in list(nodes):
-            d = p if os.path.isdir(p) else os.path.dirname(p)
-            sibling_targets.add(d)
-        for d in sibling_targets:
-            try:
-                for name in os.listdir(d):
-                    if name in IGNORE_DIR_NAMES:
-                        continue
-                    child = os.path.join(d, name)
-                    if child.startswith(root):
-                        nodes.add(child)
-            except OSError:
-                continue
+        nodes.update(_collect_siblings(nodes, root))
 
     # Optionally walk a full subtree as well.
     if full_walk_root:
@@ -826,6 +836,19 @@ class _Cache:
         timestamps = [ev.ts for ev in events if ev.ts]
         sensitive_paths = sorted({ev.path for ev in events if ev.sensitive})
         missing_count = sum(1 for s in stats.values() if not s.exists)
+        # Sibling info: emitted only when --siblings was set, so the client
+        # can include them in the tree even when a filter is active (the
+        # client-side rebuild has no disk access otherwise).
+        sibling_paths: list[str] = []
+        if self.sibling_depth > 0:
+            base_nodes = set(stats.keys())
+            for p in list(base_nodes):
+                for anc in _ancestors(p):
+                    base_nodes.add(anc)
+            tree_root = tree.get("path") or "/"
+            sibling_paths = sorted(
+                _collect_siblings(base_nodes, tree_root) - set(stats.keys())
+            )
         self._meta = {
             "event_count": len(events),
             "unique_paths": len(stats),
@@ -840,6 +863,9 @@ class _Cache:
             "sensitive_count": len(sensitive_paths),
             "sensitive_paths": sensitive_paths[:MAX_SENSITIVE_PATHS_IN_META],
             "missing_count": missing_count,
+            "siblings_on": self.sibling_depth > 0,
+            "sibling_count": len(sibling_paths),
+            "sibling_paths": sibling_paths,
         }
 
 
@@ -1465,8 +1491,11 @@ document.getElementById("legend-reset").onclick = (e) => {
 // Build a hierarchy from a filtered event list. No filesystem access, so the
 // "+1 level of siblings" the server adds under --siblings is lost — but for a
 // deliberately filtered view, the focused layout is usually what you want.
-function buildTreeFromEvents(events) {
-  if (!events.length) {
+function buildTreeFromEvents(events, extraSiblingPaths) {
+  // extraSiblingPaths: optional list of untouched paths (from meta.sibling_paths)
+  // to include as leaf nodes so --siblings keeps working under client-side
+  // filtering, which would otherwise drop them (no disk access in the browser).
+  if (!events.length && !(extraSiblingPaths && extraSiblingPaths.length)) {
     return { name: "(no events match filter)", path: "", type: "dir", children: [] };
   }
   // Aggregate per-path stats — mirror PathStats.to_dict() on the server.
@@ -1491,7 +1520,7 @@ function buildTreeFromEvents(events) {
   }
   // Common-ancestor root.
   const paths = [...stats.keys()];
-  let rootPath = paths[0];
+  let rootPath = paths[0] || (extraSiblingPaths && extraSiblingPaths[0]) || "/";
   for (const p of paths.slice(1)) {
     while (!p.startsWith(rootPath + "/") && p !== rootPath) {
       const cut = rootPath.lastIndexOf("/");
@@ -1509,6 +1538,16 @@ function buildTreeFromEvents(events) {
       if (cur === rootPath) break;
       const cut = cur.lastIndexOf("/");
       cur = cut <= 0 ? "/" : cur.substring(0, cut);
+    }
+  }
+  // Untouched siblings (from --siblings on the server). Only included whose
+  // parent is already in our node set, so they actually anchor to the tree.
+  if (extraSiblingPaths && extraSiblingPaths.length) {
+    for (const p of extraSiblingPaths) {
+      if (!p.startsWith(rootPath)) continue;
+      const cut = p.lastIndexOf("/");
+      const parent = cut <= 0 ? "/" : p.substring(0, cut);
+      if (nodes.has(parent)) nodes.add(p);
     }
   }
   // Build the parent → children index.
@@ -1550,7 +1589,11 @@ function buildTreeFromEvents(events) {
 
 function applyFiltersAndRender(opts = {}) {
   const filtered = lastEvents.filter(eventPasses);
-  const treeData = buildTreeFromEvents(filtered);
+  // Pass through the server-supplied sibling list so --siblings keeps
+  // working when a filter is active. (The server tree already has them;
+  // this only matters for the client-rebuilt path.)
+  const siblings = (lastMeta && lastMeta.sibling_paths) || null;
+  const treeData = buildTreeFromEvents(filtered, siblings);
   root = d3.hierarchy(treeData);
   root.x0 = 0; root.y0 = 0;
   collapseUntouched(root);
@@ -1922,8 +1965,9 @@ document.getElementById("diff-modal").addEventListener("click", (e) => {
 });
 
 function setMeta(meta) {
+  const sib = meta.siblings_on ? ` · siblings: +${meta.sibling_count}` : "";
   document.getElementById("meta").textContent =
-    `${meta.event_count} events · ${meta.unique_paths} paths · root: ${meta.root} · scanned ${meta.scanned_at} (${meta.scan_ms}ms)`;
+    `${meta.event_count} events · ${meta.unique_paths} paths${sib} · root: ${meta.root} · scanned ${meta.scanned_at} (${meta.scan_ms}ms)`;
   const mc = meta.missing_count || 0;
   document.getElementById("missing-count").textContent = mc ? ` (${mc})` : "";
 }
