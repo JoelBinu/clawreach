@@ -757,6 +757,39 @@ FRONTEND_HTML = r"""<!doctype html>
     padding: 4px 10px; border-radius: 4px; cursor: pointer; font: inherit;
   }
   header button:hover { background: #232b38; }
+  .filter {
+    position: relative;
+  }
+  .filter > summary {
+    list-style: none; cursor: pointer; padding: 4px 10px;
+    border: 1px solid var(--rule); border-radius: 4px;
+    background: var(--rule); color: var(--ink); font: inherit;
+    user-select: none;
+  }
+  .filter > summary::-webkit-details-marker { display: none; }
+  .filter > summary:hover { background: #232b38; }
+  .filter .count {
+    color: var(--accent-soft); margin-left: 4px;
+  }
+  .filter-body {
+    position: absolute; top: 100%; left: 0; margin-top: 4px;
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 4px;
+    padding: 8px 10px; min-width: 220px; max-width: 360px;
+    max-height: 320px; overflow-y: auto; z-index: 10;
+    box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  }
+  .filter-body label {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 2px; cursor: pointer;
+    font-size: 12px; word-break: break-all;
+  }
+  .filter-body label:hover { background: var(--rule); }
+  .filter-body input[type="checkbox"] { accent-color: var(--act-write); }
+  .filter-body .actions {
+    display: flex; gap: 8px; padding: 4px 0;
+    border-bottom: 1px solid var(--rule); margin-bottom: 4px;
+  }
+  .filter-body .actions a { color: var(--accent-soft); cursor: pointer; font-size: 11px; }
   main { display: grid; grid-template-columns: 1fr 320px; min-height: 0; }
   #viz { position: relative; overflow: hidden; }
   #viz svg { width: 100%; height: 100%; cursor: grab; }
@@ -811,6 +844,26 @@ FRONTEND_HTML = r"""<!doctype html>
 <header>
   <h1>ClawReach</h1>
   <span class="meta" id="meta">loading…</span>
+  <details class="filter" id="filter-sessions-wrap">
+    <summary>Sessions <span class="count" id="filter-sessions-count"></span></summary>
+    <div class="filter-body">
+      <div class="actions">
+        <a data-target="filter-sessions-body" data-mode="all">all</a>
+        <a data-target="filter-sessions-body" data-mode="none">none</a>
+      </div>
+      <div id="filter-sessions-body"></div>
+    </div>
+  </details>
+  <details class="filter" id="filter-projects-wrap">
+    <summary>Projects <span class="count" id="filter-projects-count"></span></summary>
+    <div class="filter-body">
+      <div class="actions">
+        <a data-target="filter-projects-body" data-mode="all">all</a>
+        <a data-target="filter-projects-body" data-mode="none">none</a>
+      </div>
+      <div id="filter-projects-body"></div>
+    </div>
+  </details>
   <button id="rescan">Re-scan</button>
   <button id="reset">Reset view</button>
   <span class="meta" style="margin-left:auto">click a node to expand/collapse · drag to pan · scroll to zoom</span>
@@ -853,6 +906,171 @@ svg.call(zoom);
 
 let root = null;
 let initialTransform = null;
+// Server-supplied state cached for re-filtering.
+let lastEvents = [];
+let lastMeta = null;
+// Filter state. `null` for either field means "all selected"; otherwise
+// it's an array of explicitly-selected values.
+let filters = loadFilters();
+
+const ACTION_PRIORITY = { write:0, edit:1, read:2, bash:3, list:4, observe:5 };
+
+function loadFilters() {
+  try {
+    const raw = localStorage.getItem("clawreach.filters");
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return { sessions: null, projects: null };
+}
+function saveFilters() {
+  try { localStorage.setItem("clawreach.filters", JSON.stringify(filters)); } catch {}
+}
+
+function eventPasses(ev) {
+  if (filters.sessions !== null && !filters.sessions.includes(ev.session)) return false;
+  if (filters.projects !== null && !filters.projects.includes(ev.project)) return false;
+  return true;
+}
+
+// Build a hierarchy from a filtered event list. No filesystem access, so the
+// "+1 level of siblings" the server adds is lost — but for a deliberately
+// filtered view, the focused layout is usually what you want.
+function buildTreeFromEvents(events) {
+  if (!events.length) {
+    return { name: "(no events match filter)", path: "", type: "dir", children: [] };
+  }
+  // Aggregate per-path stats — mirror PathStats.to_dict() on the server.
+  const stats = new Map();
+  for (const ev of events) {
+    let s = stats.get(ev.path);
+    if (!s) {
+      s = { count:0, last_ts:"", actions:{}, tools:{},
+            sessions:new Set(), projects:new Set(), sidechain:0, sensitive:false };
+      stats.set(ev.path, s);
+    }
+    s.count++;
+    if (ev.ts > s.last_ts) s.last_ts = ev.ts;
+    s.actions[ev.action] = (s.actions[ev.action] || 0) + 1;
+    s.tools[ev.tool] = (s.tools[ev.tool] || 0) + 1;
+    if (ev.session) s.sessions.add(ev.session);
+    if (ev.project) s.projects.add(ev.project);
+    if (ev.sidechain) s.sidechain++;
+    if (ev.sensitive) s.sensitive = true;
+  }
+  // Common-ancestor root.
+  const paths = [...stats.keys()];
+  let rootPath = paths[0];
+  for (const p of paths.slice(1)) {
+    while (!p.startsWith(rootPath + "/") && p !== rootPath) {
+      const cut = rootPath.lastIndexOf("/");
+      if (cut <= 0) { rootPath = "/"; break; }
+      rootPath = rootPath.substring(0, cut);
+    }
+    if (rootPath === "/") break;
+  }
+  // All ancestors of every accessed path.
+  const nodes = new Set([rootPath]);
+  for (const p of paths) {
+    let cur = p;
+    while (cur && cur.length >= rootPath.length) {
+      nodes.add(cur);
+      if (cur === rootPath) break;
+      const cut = cur.lastIndexOf("/");
+      cur = cut <= 0 ? "/" : cur.substring(0, cut);
+    }
+  }
+  // Build the parent → children index.
+  const byParent = new Map();
+  for (const n of nodes) {
+    if (n === rootPath) continue;
+    const cut = n.lastIndexOf("/");
+    const parent = cut <= 0 ? "/" : n.substring(0, cut);
+    if (!byParent.has(parent)) byParent.set(parent, []);
+    byParent.get(parent).push(n);
+  }
+  function makeNode(path) {
+    const s = stats.get(path);
+    const kids = (byParent.get(path) || []).sort();
+    const node = {
+      name: path.substring(path.lastIndexOf("/") + 1) || path,
+      path: path,
+      type: kids.length > 0 ? "dir" : (path === rootPath ? "dir" : "file"),
+    };
+    if (s) {
+      const primary = Object.keys(s.actions)
+        .sort((a, b) => (ACTION_PRIORITY[a] ?? 99) - (ACTION_PRIORITY[b] ?? 99))[0]
+        || "observe";
+      node.access = {
+        count: s.count, last_ts: s.last_ts, primary,
+        actions: s.actions, tools: s.tools,
+        sessions: [...s.sessions].sort(), projects: [...s.projects].sort(),
+        sidechain: s.sidechain, sensitive: s.sensitive,
+      };
+    }
+    if (kids.length) node.children = kids.map(makeNode);
+    return node;
+  }
+  return makeNode(rootPath);
+}
+
+function applyFiltersAndRender() {
+  const filtered = lastEvents.filter(eventPasses);
+  const treeData = buildTreeFromEvents(filtered);
+  root = d3.hierarchy(treeData);
+  root.x0 = 0; root.y0 = 0;
+  collapseUntouched(root);
+  initialTransform = null;
+  update(root);
+}
+
+function renderFilterUI(kind, all, eventsBySession) {
+  // kind: "sessions" | "projects"
+  const body = document.getElementById(`filter-${kind}-body`);
+  const selected = filters[kind] === null ? new Set(all) : new Set(filters[kind]);
+  // Count events per option for context.
+  const counts = {};
+  for (const ev of lastEvents) {
+    const k = kind === "sessions" ? ev.session : ev.project;
+    if (!k) continue;
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  body.innerHTML = all.map(v => {
+    const isChecked = selected.has(v);
+    const label = kind === "sessions" ? `${v.slice(0, 8)}…` : v;
+    return `<label><input type="checkbox" value="${v}" ${isChecked ? "checked" : ""}> `
+         + `${label} <span style="color:var(--muted);margin-left:auto">${counts[v] || 0}</span></label>`;
+  }).join("");
+  body.querySelectorAll("input[type=checkbox]").forEach(cb => {
+    cb.onchange = () => {
+      const picked = [...body.querySelectorAll("input:checked")].map(i => i.value);
+      filters[kind] = picked.length === all.length ? null : picked;
+      saveFilters();
+      updateFilterSummaries();
+      applyFiltersAndRender();
+    };
+  });
+  // "all" / "none" shortcuts.
+  document.querySelectorAll(`a[data-target=filter-${kind}-body]`).forEach(a => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const want = a.dataset.mode === "all";
+      body.querySelectorAll("input[type=checkbox]").forEach(cb => { cb.checked = want; });
+      filters[kind] = want ? null : [];
+      saveFilters();
+      updateFilterSummaries();
+      applyFiltersAndRender();
+    };
+  });
+}
+
+function updateFilterSummaries() {
+  for (const kind of ["sessions", "projects"]) {
+    const all = (lastMeta && lastMeta[kind]) || [];
+    const sel = filters[kind] === null ? all.length : filters[kind].length;
+    document.getElementById(`filter-${kind}-count`).textContent =
+      `(${sel}/${all.length})`;
+  }
+}
 
 // Color resolved from CSS custom properties so the palette stays in one place.
 const ACTION_COLORS = {
@@ -1084,14 +1302,27 @@ document.getElementById("alert-show").onclick = () => {
 
 async function load(rescan) {
   const r = await fetch(rescan ? "/api/rescan" : "/api/tree");
-  const { tree: data, meta } = await r.json();
+  const { tree: data, events, meta } = await r.json();
+  lastEvents = events || [];
+  lastMeta = meta;
   setMeta(meta);
   setAlert(meta);
-  root = d3.hierarchy(data);
-  root.x0 = 0; root.y0 = 0;
-  collapseUntouched(root);
-  initialTransform = null;
-  update(root);
+  // Render the filter UIs against the new option lists.
+  renderFilterUI("sessions", meta.sessions || []);
+  renderFilterUI("projects", meta.projects || []);
+  updateFilterSummaries();
+  // First render uses the server-built tree (with sibling context). Once the
+  // user touches a filter we switch to the client-built filtered hierarchy.
+  if ((filters.sessions === null || filters.sessions.length === (meta.sessions || []).length)
+      && (filters.projects === null || filters.projects.length === (meta.projects || []).length)) {
+    root = d3.hierarchy(data);
+    root.x0 = 0; root.y0 = 0;
+    collapseUntouched(root);
+    initialTransform = null;
+    update(root);
+  } else {
+    applyFiltersAndRender();
+  }
 }
 
 document.getElementById("rescan").onclick = () => load(true);
