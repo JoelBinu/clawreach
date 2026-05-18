@@ -1495,15 +1495,18 @@ function applyFiltersAndRender(opts = {}) {
   root = d3.hierarchy(treeData);
   root.x0 = 0; root.y0 = 0;
   collapseUntouched(root);
-  // skipFit: during time-slider playback we want the camera to stay put.
-  // On manual filter changes we re-fit so the focused view is centered.
-  if (!opts.skipFit) initialTransform = null;
+  // Default: keep the user's current zoom/pan. Filter changes are
+  // "show me a subset" — they shouldn't yank the camera around (which
+  // also caused a reflow loop with the sensitive banner show/hiding).
+  // Force a re-fit only when explicitly asked OR when the filtered set
+  // is empty (otherwise the user would be left staring at blank space).
+  if (opts.fit || filtered.length === 0) initialTransform = null;
   update(root);
   // Banner reflects the current view — recompute on every filter change.
   setAlert();
 }
 
-function setTimeCutoff(ms, opts = {}) {
+function setTimeCutoff(ms) {
   timeCutoff = ms;
   const slider = document.getElementById("time-slider");
   slider.value = ms;
@@ -1512,7 +1515,7 @@ function setTimeCutoff(ms, opts = {}) {
     new Date(ms).toLocaleString(undefined, { month: "short", day: "2-digit",
                                               hour: "2-digit", minute: "2-digit",
                                               second: "2-digit" });
-  applyFiltersAndRender(opts);
+  applyFiltersAndRender();
 }
 
 function initTimeSlider(meta) {
@@ -1542,12 +1545,12 @@ function togglePlay() {
   btn.textContent = isPlaying ? "⏸" : "▶";
   if (isPlaying) {
     // If we're at the end, rewind to the start before playing.
-    if (timeCutoff >= timeMax) setTimeCutoff(timeMin, { skipFit: true });
+    if (timeCutoff >= timeMax) setTimeCutoff(timeMin);
     // ~10 ticks/sec, advancing ~2% of the range per tick → ~5s playback.
     const stepSize = Math.max(1, Math.floor((timeMax - timeMin) / 50));
     playInterval = setInterval(() => {
       const next = Math.min(timeMax, timeCutoff + stepSize);
-      setTimeCutoff(next, { skipFit: true });
+      setTimeCutoff(next);
       if (next >= timeMax) togglePlay();  // auto-pause at end
     }, 100);
   } else {
@@ -1703,7 +1706,15 @@ function update(source) {
   if (initialTransform === null) {
     const bbox = gZoom.node().getBBox();
     const w = svg.node().clientWidth, h = svg.node().clientHeight;
-    const scale = Math.min(1, (w - 40) / Math.max(bbox.width, 1), (h - 40) / Math.max(bbox.height, 1));
+    // Bail on degenerate inputs — a tiny viewport (layout not settled) or
+    // an empty bbox (no nodes) used to produce a broken transform and a
+    // tree that visibly shrank with each render.
+    if (w < 20 || h < 20 || bbox.width < 1 || bbox.height < 1) {
+      initialTransform = d3.zoomIdentity;
+      svg.call(zoom.transform, initialTransform);
+      return;
+    }
+    const scale = Math.min(1, (w - 40) / bbox.width, (h - 40) / bbox.height);
     const tx = 20 - bbox.x * scale;
     const ty = (h - bbox.height * scale) / 2 - bbox.y * scale;
     initialTransform = d3.zoomIdentity.translate(tx, ty).scale(scale);
@@ -1957,7 +1968,10 @@ async function load(rescan) {
     initialTransform = null;
     update(root);
   } else {
-    applyFiltersAndRender();
+    // Initial / reload render of a filtered view — fit it once so the
+    // user sees their saved filter actually applied. Subsequent filter
+    // toggles preserve the viewport.
+    applyFiltersAndRender({ fit: true });
   }
 }
 
