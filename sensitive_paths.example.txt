@@ -1,0 +1,37 @@
+# ClawReach — sensitive paths config
+#
+# Copy this file to ~/.clawreach/sensitive_paths.txt and edit it.
+# Any access Claude has made to a matching path will be flagged in the UI:
+# red banner at the top, red ring on the node, and "(sensitive)" chip in
+# the sidebar. Lines starting with # are comments.
+#
+# Three pattern types are supported:
+#
+#   ~/.ssh/                 ← trailing slash: directory AND everything under it
+#   *.env                   ← glob characters (* ? [): matched against basename
+#                              and full path via fnmatch
+#   /Users/me/note.txt      ← no trailing slash, no globs: exact path match
+#                              (also matches as a directory prefix, so it works
+#                              for either a file or a directory you forgot the
+#                              trailing slash on)
+#
+# Tildes are expanded to your home directory.
+#
+# By default this file does NOT exist and the sensitive-path banner stays off.
+# Add only the paths YOU want flagged — keep it small and meaningful so the
+# banner is a useful signal, not noise.
+
+# ----- common candidates (uncomment / edit as you like) -----
+
+# ~/.ssh/
+# ~/.aws/
+# ~/.gnupg/
+# ~/.config/gh/
+# /Library/Keychains/
+
+# *.env
+# *.env.*
+# *.pem
+# *.key
+# id_rsa
+# id_ed25519

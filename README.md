@@ -4,7 +4,29 @@
 
 ClawReach parses your local [Claude Code](https://docs.claude.com/en/docs/claude-code) transcripts, extracts every file and directory the agent (and any subagents) touched, and renders the surrounding filesystem as a collapsible D3 tree. Each node is colored by what Claude did to it — **written, edited, read, bash-touched, listed, or observed in output** — so the signal is obvious at a glance.
 
-**v2 highlights:** sensitive-path audit (red banner when Claude touches `~/.ssh`, `*.env`, etc.) · time slider to replay a session · session/project filters · live auto-refresh via SSE · click any written/edited file to **diff exactly what Claude wrote** against the current state, using Claude Code's own file-history snapshots.
+**v2 highlights:** sensitive-path audit (configurable per user — see [Sensitive paths](#sensitive-paths) below) · time slider to replay a session · session/project filters · live auto-refresh via SSE · click any written/edited file to **diff exactly what Claude wrote** against the current state, using Claude Code's own file-history snapshots.
+
+## Sensitive paths
+
+ClawReach can flag accesses to "AI-free zones" — paths you'd rather Claude didn't touch. There are no built-in defaults; the feature is opt-in via a file you own:
+
+```
+~/.clawreach/sensitive_paths.txt
+```
+
+Each non-comment line is a directory, glob, or path:
+
+```
+~/.ssh/              # trailing slash → that dir and everything under it
+~/.aws/
+*.env                # glob → matches basename and full path (fnmatch)
+*.pem
+~/secrets.txt        # exact file path
+```
+
+If the file doesn't exist, the sensitive-path banner stays off — no false positives. Override the location with `--sensitive-paths FILE`. See [`sensitive_paths.example.txt`](sensitive_paths.example.txt) for a starter template you can copy.
+
+When you do configure it, every matched access is tagged in the JSON (`access.sensitive: true`), gets a red ring around the tree node, a "⚠ sensitive" chip in the sidebar, and counts toward the red banner at the top of the page.
 
 ```
 ┌─ ClawReach ── 147 events · 52 paths · root: / ──────[Re-scan][Reset]──┐
@@ -92,7 +114,8 @@ python3 clawreach.py [options]
   --root PATH              Override tree root (default: common ancestor of all accessed paths)
   --full-walk DIR          Additionally walk this whole subtree (slow)
   --full-home              Shortcut for --full-walk $HOME
-  --sensitive-patterns F   Custom regex list (one per line, # comments). Replaces defaults.
+  --sensitive-paths FILE   Paths/dirs/globs you consider AI-free (default: ~/.clawreach/sensitive_paths.txt).
+                           If the file doesn't exist, no paths are flagged. See sensitive_paths.example.txt.
   --no-watch               Disable file watcher (no SSE auto-refresh)
   --watch-interval SEC     Watcher poll interval (default: 2.0)
   --no-browser             Don't auto-open the browser

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -95,25 +96,15 @@ ABS_PATH_IN_TEXT_RE = re.compile(r"(?:^|[\s'\"`(\[])(/[\w./\-+@:%]{2,})")
 # like a recursive `ls` or a noisy `npm install`.
 MAX_MINED_PATHS_PER_RESULT = 100
 
-# Paths Claude probably shouldn't be in. Surfaces in the UI as a red ring on
-# the node and a banner count at the top of the page. Override with
-# --sensitive-patterns FILE (one regex per line).
-DEFAULT_SENSITIVE_PATTERNS = [
-    r"(^|/)\.ssh(/|$)",
-    r"(^|/)\.aws(/|$)",
-    r"(^|/)\.gnupg(/|$)",
-    r"(^|/)\.config/gh/",
-    r"/Library/Keychains/",
-    r"\.env(\.|$)",
-    r"\.pem$",
-    r"\.key$",
-    r"id_(rsa|ed25519|ecdsa|dsa)(\.|$)",
-    r"credentials?",
-    r"secret",
-    r"\btoken\b",
-    r"\bpassword\b",
-    r"\bprivate[_-]?key\b",
-]
+# The sensitive-path / "AI-free zones" feature reads its config from a
+# user-owned file (default: ~/.clawreach/sensitive_paths.txt). If the file
+# doesn't exist, the feature is silently off — no false positives, no banner.
+# The file is one pattern per line, where each pattern is either:
+#   - A directory path ending in `/`   → that dir and everything under it
+#   - A glob with *, ?, [              → fnmatch syntax against the full path
+#   - Any other path                   → exact match OR directory prefix
+# Lines starting with # are comments. ~ is expanded to the user's home dir.
+DEFAULT_SENSITIVE_PATHS_FILE = Path.home() / ".clawreach" / "sensitive_paths.txt"
 # Cap how many sensitive paths we ship for the banner's click-to-jump list.
 MAX_SENSITIVE_PATHS_IN_META = 50
 
@@ -378,7 +369,11 @@ def _mine_result_paths(src_tool: str, text: str, cwd: str | None) -> list[tuple[
 
 def ingest_all(projects_dir: Path,
                sensitive_patterns: list[str] | None = None) -> list[AccessEvent]:
-    """Parse every transcript under projects_dir; tag sensitive paths in place."""
+    """Parse every transcript under projects_dir; tag sensitive paths in place.
+
+    `sensitive_patterns` is the *contents* of the user's sensitive-paths file,
+    not regex source. If None or empty, no paths are flagged sensitive.
+    """
     events: list[AccessEvent] = []
     if not projects_dir.exists():
         return events
@@ -387,20 +382,61 @@ def ingest_all(projects_dir: Path,
             events.extend(parse_transcript(jsonl))
         except OSError:
             continue
-    matcher = _compile_sensitive(sensitive_patterns or DEFAULT_SENSITIVE_PATTERNS)
+    matcher = _compile_sensitive(sensitive_patterns) if sensitive_patterns else None
     if matcher is not None:
         for ev in events:
-            if matcher.search(ev.path):
+            if matcher(ev.path):
                 ev.sensitive = True
     return events
 
 
-def _compile_sensitive(patterns: list[str]) -> "re.Pattern | None":
-    """Combine patterns into one case-insensitive regex; None if list is empty."""
-    cleaned = [p for p in (s.strip() for s in patterns) if p and not p.startswith("#")]
-    if not cleaned:
+def _compile_sensitive(lines: list[str]):
+    """Turn a sensitive-paths file's lines into a fast matcher: path → bool.
+
+    Each non-comment line becomes one of:
+      ~/.ssh/          → matches the dir and everything under it
+      *.env            → fnmatch glob (against basename and full path)
+      /Users/me/file   → exact match OR directory prefix
+    """
+    dir_prefixes: list[str] = []
+    globs: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = os.path.expanduser(line)
+        if line.endswith("/"):
+            dir_prefixes.append(line.rstrip("/"))
+        elif any(c in line for c in "*?["):
+            globs.append(line)
+        else:
+            # No trailing slash and no glob chars — could be a file or a dir.
+            # Treat as both: matches exactly or as a directory prefix.
+            dir_prefixes.append(line)
+    if not dir_prefixes and not globs:
         return None
-    return re.compile("|".join(f"(?:{p})" for p in cleaned), re.IGNORECASE)
+
+    def matches(path: str) -> bool:
+        for prefix in dir_prefixes:
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+        if globs:
+            base = os.path.basename(path)
+            for g in globs:
+                if fnmatch.fnmatch(path, g) or fnmatch.fnmatch(base, g):
+                    return True
+        return False
+    return matches
+
+
+def _read_sensitive_paths_file(path: Path) -> list[str]:
+    """Read the user's sensitive-paths file. Empty list if missing/unreadable."""
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -2087,9 +2123,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser.")
     ap.add_argument("--print-only", action="store_true",
                     help="Dump the JSON tree to stdout and exit (skip the server).")
-    ap.add_argument("--sensitive-patterns", type=Path, default=None, metavar="FILE",
-                    help="Path to a file with custom sensitive-path regexes (one per line, "
-                         "# for comments). Replaces the built-in list.")
+    ap.add_argument("--sensitive-paths", type=Path, default=DEFAULT_SENSITIVE_PATHS_FILE,
+                    metavar="FILE",
+                    help="File listing paths/dirs/globs you consider AI-free (default: "
+                         "%(default)s). Each non-comment line is a directory ending in / "
+                         "(matches contents too), a glob like *.env, or an exact path. "
+                         "If the file doesn't exist, the sensitive-path banner stays off.")
     ap.add_argument("--no-watch", action="store_true",
                     help="Disable the file watcher (no auto-refresh on transcript changes).")
     ap.add_argument("--watch-interval", type=float, default=2.0, metavar="SEC",
@@ -2103,13 +2142,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.full_home and not full_walk:
         full_walk = str(Path.home())
 
-    sensitive_patterns: list[str] | None = None
-    if args.sensitive_patterns:
-        try:
-            sensitive_patterns = args.sensitive_patterns.read_text().splitlines()
-        except OSError as e:
-            print(f"[clawreach] could not read --sensitive-patterns: {e}", file=sys.stderr)
-            return 2
+    sensitive_patterns = _read_sensitive_paths_file(args.sensitive_paths)
+    if sensitive_patterns:
+        non_comment = sum(1 for ln in sensitive_patterns
+                          if ln.strip() and not ln.strip().startswith("#"))
+        print(f"[clawreach] sensitive paths: {non_comment} patterns from {args.sensitive_paths}",
+              file=sys.stderr)
+    else:
+        print(f"[clawreach] sensitive paths: none configured "
+              f"(create {args.sensitive_paths} to enable; one path/glob per line)",
+              file=sys.stderr)
 
     cache = _Cache(args.projects, args.root, full_walk, sensitive_patterns,
                    file_history_dir=args.file_history)
