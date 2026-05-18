@@ -1115,6 +1115,30 @@ FRONTEND_HTML = r"""<!doctype html>
     border: 1px solid var(--rule); color: var(--ink); font-size: 11px;
     display: grid; grid-template-columns: max-content max-content; gap: 4px 14px;
   }
+  /* Floating viewport controls — always-visible safety net when the tree
+     has been panned/zoomed off-screen. Top-right corner of the viz area. */
+  .viz-controls {
+    position: absolute; top: 10px; right: 10px; z-index: 5;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .viz-controls button {
+    width: 34px; height: 34px;
+    background: rgba(20,24,31,.92);
+    border: 1px solid var(--rule);
+    color: var(--ink); border-radius: 4px; cursor: pointer;
+    font-size: 16px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .viz-controls button:hover { background: var(--rule); border-color: var(--accent-soft); }
+  .viz-controls button:active { background: #232b38; }
+  .viz-controls .recenter { font-size: 18px; }
+  /* Brief flash on the recenter button when the keyboard shortcut fires,
+     so the user discovers it exists. */
+  @keyframes flash-recenter {
+    0%   { box-shadow: 0 0 0 2px var(--accent-soft); }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
+  .viz-controls .recenter.flash { animation: flash-recenter .6s ease-out; }
   .legend .item { display: flex; align-items: center; gap: 6px; }
   .legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
   .legend .hint { grid-column: 1 / -1; color: var(--muted); margin-top: 4px;
@@ -1162,6 +1186,11 @@ FRONTEND_HTML = r"""<!doctype html>
 <main>
   <div id="viz">
     <svg></svg>
+    <div class="viz-controls">
+      <button id="zoom-in"  title="Zoom in (+ or =)">+</button>
+      <button id="zoom-out" title="Zoom out (− or _)">−</button>
+      <button id="recenter" class="recenter" title="Recenter view (R or 0)">⌂</button>
+    </div>
     <div class="legend">
       <div class="item"><span class="dot" style="background:var(--act-write)"></span>written / generated</div>
       <div class="item"><span class="dot" style="background:var(--act-edit)"></span>edited in place</div>
@@ -1169,7 +1198,7 @@ FRONTEND_HTML = r"""<!doctype html>
       <div class="item"><span class="dot" style="background:var(--act-bash)"></span>bash-touched</div>
       <div class="item"><span class="dot" style="background:var(--act-list)"></span>listed / matched</div>
       <div class="item"><span class="dot" style="background:var(--act-observe)"></span>observed in output</div>
-      <div class="hint">node size = access count · color = primary action</div>
+      <div class="hint">node size = access count · color = primary action · press <kbd>R</kbd> to recenter</div>
     </div>
   </div>
   <aside id="details">
@@ -1764,7 +1793,48 @@ async function load(rescan) {
 }
 
 document.getElementById("rescan").onclick = () => load(true);
-document.getElementById("reset").onclick = () => { initialTransform = null; update(root); };
+document.getElementById("reset").onclick = () => recenter();
+
+// --- Viewport controls -----------------------------------------------------
+// Two ways to never lose the tree: floating overlay buttons (always visible
+// in the top-right of the viz area) and keyboard shortcuts.
+function recenter() {
+  initialTransform = null;
+  update(root);
+}
+function zoomBy(factor) {
+  svg.transition().duration(180).call(zoom.scaleBy, factor);
+}
+document.getElementById("recenter").onclick = recenter;
+document.getElementById("zoom-in").onclick  = () => zoomBy(1.4);
+document.getElementById("zoom-out").onclick = () => zoomBy(1 / 1.4);
+
+// Keyboard shortcuts. Ignored when focus is in an input/textarea/select or
+// when a modifier key is held (so e.g. Cmd-R still reloads the page).
+document.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target && e.target.matches && e.target.matches("input, textarea, select, [contenteditable]")) return;
+  const k = e.key;
+  if (k === "r" || k === "R" || k === "0" || k === "Home") {
+    e.preventDefault();
+    recenter();
+    // Flash the button so users discover the shortcut works.
+    const el = document.getElementById("recenter");
+    el.classList.remove("flash");
+    void el.offsetWidth;  // restart animation
+    el.classList.add("flash");
+  } else if (k === "+" || k === "=") {
+    e.preventDefault(); zoomBy(1.4);
+  } else if (k === "-" || k === "_") {
+    e.preventDefault(); zoomBy(1 / 1.4);
+  } else if (k === "Escape") {
+    // Close the diff modal first if it's open; otherwise close any
+    // open filter dropdowns (a small bonus polish).
+    const dlg = document.getElementById("diff-modal");
+    if (dlg.open) { dlg.close(); return; }
+    document.querySelectorAll("details.filter[open]").forEach(d => (d.open = false));
+  }
+});
 
 // Watch mode: listen for tree-updated SSE events and re-fetch.
 // Suppressed during playback so the user's animation isn't interrupted.
