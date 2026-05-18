@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **Untouched siblings are off by default.** The tree now shows only the paths Claude touched and the directories that connect them to the root. The previous "one level of siblings for context" behavior is now opt-in via the new `--siblings` flag — it added an untouched node for every neighbor of every touched path, which on large transcript corpora buried the signal (e.g. ~35k nodes vs ~8.5k for the focused view).
+
 ## v2 — 2026-05-18
 
 ### New
