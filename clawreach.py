@@ -14,6 +14,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
+import hashlib
 import json
 import os
 import queue
@@ -22,6 +24,7 @@ import shlex
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -34,7 +37,11 @@ from typing import Iterable
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+DEFAULT_FILE_HISTORY_DIR = Path.home() / ".claude" / "file-history"
 DEFAULT_PORT = 8765
+# Cap snapshot/current content sent to the browser. Bigger files still diff,
+# but each side is truncated and marked.
+MAX_DIFF_CONTENT_BYTES = 256 * 1024
 
 # What Claude *did* to the path. Drives the visual category in the frontend.
 #   read    — saw the bytes (Read, cat, Grep with content)
@@ -581,6 +588,77 @@ def _materialize(root: str, nodes: set[str], stats: dict[str, PathStats]) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Snapshot diffing — resolve and diff ~/.claude/file-history/<sess>/<hash>@v2
+# ---------------------------------------------------------------------------
+
+# Claude Code names snapshot files by the first 8 bytes of the SHA-256 of the
+# original file's absolute path, hex-encoded, with a "@v2" suffix.
+def _snapshot_filename(abs_path: str) -> str:
+    return hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:16] + "@v2"
+
+
+def _find_snapshot(file_history_dir: Path, abs_path: str,
+                   sessions: Iterable[str]) -> tuple[str, Path] | None:
+    """First session that has a snapshot of `abs_path`, or None.
+
+    Caller usually passes `sessions` ordered by relevance (e.g. the sessions
+    that actually touched this path, most recent first).
+    """
+    fn = _snapshot_filename(abs_path)
+    for s in sessions:
+        if not s:
+            continue
+        p = file_history_dir / s / fn
+        if p.exists():
+            return s, p
+    return None
+
+
+def _read_capped(path: Path, cap: int) -> tuple[str, bool]:
+    """Read text from path, capped at `cap` bytes. Returns (text, truncated)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return "", False
+    truncated = len(data) > cap
+    if truncated:
+        data = data[:cap]
+    return data.decode("utf-8", errors="replace"), truncated
+
+
+def _diff_rows(old: str, new: str) -> list[dict]:
+    """Side-by-side line diff using difflib.
+
+    Each row is {t: equal|del|add|change, l: left_line, r: right_line}.
+    Frontend renders rows directly — no diff lib needed in the browser.
+    """
+    old_lines = old.splitlines()
+    new_lines = new.splitlines()
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    rows: list[dict] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for a, b in zip(old_lines[i1:i2], new_lines[j1:j2]):
+                rows.append({"t": "equal", "l": a, "r": b})
+        elif tag == "delete":
+            for a in old_lines[i1:i2]:
+                rows.append({"t": "del", "l": a, "r": ""})
+        elif tag == "insert":
+            for b in new_lines[j1:j2]:
+                rows.append({"t": "add", "l": "", "r": b})
+        elif tag == "replace":
+            left = old_lines[i1:i2]
+            right = new_lines[j1:j2]
+            for k in range(max(len(left), len(right))):
+                rows.append({
+                    "t": "change",
+                    "l": left[k] if k < len(left) else "",
+                    "r": right[k] if k < len(right) else "",
+                })
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Server — stdlib HTTP, serves frontend + JSON API
 # ---------------------------------------------------------------------------
 
@@ -592,11 +670,13 @@ class _Cache:
     """
 
     def __init__(self, projects_dir: Path, root: str | None, full_walk_root: str | None,
-                 sensitive_patterns: list[str] | None = None):
+                 sensitive_patterns: list[str] | None = None,
+                 file_history_dir: Path | None = None):
         self.projects_dir = projects_dir
         self.root = root
         self.full_walk_root = full_walk_root
         self.sensitive_patterns = sensitive_patterns  # None → use defaults
+        self.file_history_dir = file_history_dir or DEFAULT_FILE_HISTORY_DIR
         self._lock = threading.Lock()
         self._tree: dict | None = None
         self._events: list[AccessEvent] = []
@@ -756,8 +836,59 @@ def make_handler(cache: _Cache, html: str):
             if self.path == "/api/events":
                 self._serve_sse()
                 return
+            if self.path.startswith("/api/snapshot"):
+                self._serve_snapshot()
+                return
             self.send_response(404)
             self.end_headers()
+
+        def _serve_snapshot(self):
+            """Resolve a path's snapshot and return JSON with side-by-side diff."""
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            abs_path = (qs.get("path") or [""])[0]
+            session_hint = (qs.get("session") or [""])[0]
+            if not abs_path:
+                self._send_json({"error": "missing path"}, status=400)
+                return
+            # Walk the cache to find which sessions touched this path; try the
+            # hinted session first, then the others — most recent first feels
+            # right but PathStats.sessions is sorted alphabetically.
+            _, events, _ = cache.get()
+            sessions_for_path = sorted(
+                {ev.session for ev in events if ev.path == abs_path and ev.session},
+                reverse=True)  # roughly recent-first for uuid-prefixed session ids
+            ordered = ([session_hint] if session_hint else []) + \
+                      [s for s in sessions_for_path if s != session_hint]
+            hit = _find_snapshot(cache.file_history_dir, abs_path, ordered)
+            if hit is None:
+                self._send_json({
+                    "missing": True,
+                    "reason": "No snapshot found for this path in any session that touched it.",
+                    "expected_filename": _snapshot_filename(abs_path),
+                    "searched_sessions": ordered,
+                }, status=200)
+                return
+            sess, snap_path = hit
+            snap_text, snap_trunc = _read_capped(snap_path, MAX_DIFF_CONTENT_BYTES)
+            cur_text, cur_trunc = "", False
+            cur_exists = os.path.exists(abs_path)
+            if cur_exists:
+                cur_text, cur_trunc = _read_capped(Path(abs_path), MAX_DIFF_CONTENT_BYTES)
+            self._send_json({
+                "missing": False,
+                "session": sess,
+                "snapshot": {
+                    "path": str(snap_path), "bytes": snap_path.stat().st_size,
+                    "text": snap_text, "truncated": snap_trunc,
+                },
+                "current": {
+                    "path": abs_path, "exists": cur_exists,
+                    "bytes": os.path.getsize(abs_path) if cur_exists else 0,
+                    "text": cur_text, "truncated": cur_trunc,
+                },
+                "diff": _diff_rows(snap_text, cur_text),
+            })
 
         def _serve_sse(self):
             """Stream cache events to the client until they disconnect."""
@@ -898,6 +1029,43 @@ FRONTEND_HTML = r"""<!doctype html>
     background: transparent; border: none; color: var(--ink);
     padding: 0 6px; cursor: pointer; font-size: 14px;
   }
+  /* Diff modal */
+  #diff-modal {
+    border: none; padding: 0; max-width: 92vw; max-height: 88vh;
+    width: 1200px; background: var(--panel); color: var(--ink);
+    border-radius: 6px; overflow: hidden;
+  }
+  #diff-modal::backdrop { background: rgba(0,0,0,.55); }
+  .diff-head {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 14px; border-bottom: 1px solid var(--rule);
+    background: var(--bg);
+  }
+  .diff-head .title { font-size: 12px; color: var(--accent-soft); word-break: break-all; }
+  .diff-head .stats { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .diff-head button {
+    background: var(--rule); color: var(--ink); border: 1px solid var(--rule);
+    padding: 3px 10px; border-radius: 3px; cursor: pointer; font: inherit;
+  }
+  .diff-body {
+    overflow: auto; max-height: calc(88vh - 50px); background: var(--bg);
+    font: 11px/1.4 ui-monospace, monospace;
+  }
+  .diff-body table { border-collapse: collapse; width: 100%; }
+  .diff-body td {
+    padding: 1px 8px; vertical-align: top; white-space: pre; word-break: normal;
+    border-bottom: 1px solid transparent;
+  }
+  .diff-body td.side {
+    width: 50%; max-width: 0;   /* lets long lines scroll the table cell */
+    overflow-x: auto;
+  }
+  .diff-body tr.equal td { color: var(--muted); }
+  .diff-body tr.add td.right   { background: rgba(255, 122, 69, .08); color: var(--act-write); }
+  .diff-body tr.del td.left    { background: rgba(239, 68,  68, .12); color: var(--danger-soft); }
+  .diff-body tr.change td.left { background: rgba(255, 209, 102, .08); color: var(--act-edit); }
+  .diff-body tr.change td.right{ background: rgba(255, 209, 102, .08); color: var(--act-edit); }
+  .diff-empty { padding: 40px; text-align: center; color: var(--muted); }
   .filter-body .actions {
     display: flex; gap: 8px; padding: 4px 0;
     border-bottom: 1px solid var(--rule); margin-bottom: 4px;
@@ -1010,6 +1178,15 @@ FRONTEND_HTML = r"""<!doctype html>
     <div id="sel-body"></div>
   </aside>
 </main>
+
+<dialog id="diff-modal">
+  <div class="diff-head">
+    <div class="title" id="diff-title">…</div>
+    <div class="stats" id="diff-stats"></div>
+    <button id="diff-close">Close</button>
+  </div>
+  <div class="diff-body" id="diff-body"></div>
+</dialog>
 
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
@@ -1414,10 +1591,18 @@ function showDetails(d) {
   const projects = a.projects.map(p => `<li>${p}</li>`).join("");
   const sensChip = a.sensitive
     ? `<span class="sensitive-chip">⚠ sensitive</span>` : "";
+  const canDiff = a.primary === "write" || a.primary === "edit" || a.actions.write || a.actions.edit;
+  const diffBtn = canDiff
+    ? `<button class="diff-btn" data-path="${(d.data.path || "").replace(/"/g, '&quot;')}"
+              data-session="${(a.sessions && a.sessions[0]) || ""}"
+              style="margin-left:8px;padding:2px 8px;background:var(--rule);
+                     color:var(--ink);border:1px solid var(--rule);border-radius:3px;
+                     cursor:pointer;font:inherit;font-size:11px">View diff</button>`
+    : "";
   body.innerHTML = `
     <span class="primary-chip" style="background:${ACTION_COLORS[a.primary]}">
       ${ACTION_LABELS[a.primary]}
-    </span>${sensChip}
+    </span>${sensChip}${diffBtn}
     <div class="action-bar">${bar}</div>
     <dl>
       <dt>type</dt><dd>${d.data.type}</dd>
@@ -1430,7 +1615,67 @@ function showDetails(d) {
     <h2>Sessions</h2><ul>${sessions}</ul>
     <h2>Projects</h2><ul>${projects}</ul>
   `;
+  // Wire the "View diff" button if it exists.
+  const btn = body.querySelector(".diff-btn");
+  if (btn) btn.onclick = () => openDiff(btn.dataset.path, btn.dataset.session);
 }
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
+}
+
+async function openDiff(absPath, sessionHint) {
+  const modal = document.getElementById("diff-modal");
+  document.getElementById("diff-title").textContent = absPath;
+  document.getElementById("diff-stats").textContent = "loading…";
+  document.getElementById("diff-body").innerHTML =
+    `<div class="diff-empty">Fetching snapshot…</div>`;
+  if (!modal.open) modal.showModal();
+
+  const url = `/api/snapshot?path=${encodeURIComponent(absPath)}`
+            + (sessionHint ? `&session=${encodeURIComponent(sessionHint)}` : "");
+  let data;
+  try {
+    const r = await fetch(url);
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("diff-body").innerHTML =
+      `<div class="diff-empty">Error: ${escapeHtml(e.message || e)}</div>`;
+    return;
+  }
+  if (data.missing) {
+    document.getElementById("diff-stats").textContent = "no snapshot";
+    document.getElementById("diff-body").innerHTML =
+      `<div class="diff-empty">
+         No snapshot found for this path.<br>
+         Expected filename: <code>${escapeHtml(data.expected_filename || "")}</code><br>
+         Searched sessions: ${(data.searched_sessions || []).length}
+       </div>`;
+    return;
+  }
+  // Render the diff rows.
+  const changeCount = data.diff.filter(r => r.t !== "equal").length;
+  document.getElementById("diff-stats").textContent =
+    `session ${data.session.slice(0, 8)}…  ·  `
+    + `${data.snapshot.bytes}B → ${data.current.bytes}B  ·  `
+    + `${changeCount} changed line${changeCount === 1 ? "" : "s"}`
+    + (data.snapshot.truncated || data.current.truncated ? "  ·  (truncated)" : "");
+  const rows = data.diff.map(r =>
+    `<tr class="${r.t}">
+       <td class="side left">${escapeHtml(r.l) || "&nbsp;"}</td>
+       <td class="side right">${escapeHtml(r.r) || "&nbsp;"}</td>
+     </tr>`
+  ).join("");
+  document.getElementById("diff-body").innerHTML =
+    `<table><tbody>${rows || `<tr><td colspan=2 class="diff-empty">No differences</td></tr>`}</tbody></table>`;
+}
+
+document.getElementById("diff-close").onclick = () =>
+  document.getElementById("diff-modal").close();
+// Click on backdrop closes the dialog.
+document.getElementById("diff-modal").addEventListener("click", (e) => {
+  if (e.target.id === "diff-modal") e.target.close();
+});
 
 function setMeta(meta) {
   document.getElementById("meta").textContent =
@@ -1572,6 +1817,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Disable the file watcher (no auto-refresh on transcript changes).")
     ap.add_argument("--watch-interval", type=float, default=2.0, metavar="SEC",
                     help="Watcher poll interval (default: %(default)s seconds).")
+    ap.add_argument("--file-history", type=Path, default=DEFAULT_FILE_HISTORY_DIR,
+                    help="Path to Claude Code's file-history dir (default: %(default)s). "
+                         "Used by the diff viewer.")
     args = ap.parse_args(argv)
 
     full_walk = args.full_walk
@@ -1586,7 +1834,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[clawreach] could not read --sensitive-patterns: {e}", file=sys.stderr)
             return 2
 
-    cache = _Cache(args.projects, args.root, full_walk, sensitive_patterns)
+    cache = _Cache(args.projects, args.root, full_walk, sensitive_patterns,
+                   file_history_dir=args.file_history)
 
     if args.print_only:
         tree, events, meta = cache.get()
